@@ -23,13 +23,13 @@ services:
       - LTX_DISTILLED_LORA_PATH=/models/ltx-2-19b-distilled-lora.safetensors
       - LTX_DISTILLED_LORA_STRENGTH=0.6
 
-      # Generation defaults - 9:16 1080p vertical video
+      # Generation defaults - 9:16 1080p vertical (quality optimized)
       - LTX_DEFAULT_WIDTH=1080
       - LTX_DEFAULT_HEIGHT=1920
-      - LTX_DEFAULT_NUM_FRAMES=121
+      - LTX_DEFAULT_NUM_FRAMES=161
       - LTX_DEFAULT_FRAME_RATE=25.0
-      - LTX_DEFAULT_NUM_INFERENCE_STEPS=30
-      - LTX_DEFAULT_CFG_GUIDANCE_SCALE=3.0
+      - LTX_DEFAULT_NUM_INFERENCE_STEPS=40
+      - LTX_DEFAULT_CFG_GUIDANCE_SCALE=3.5
 
       # Performance settings
       - LTX_ENABLE_FP8=true
