@@ -1,0 +1,86 @@
+version: "3.8"
+
+services:
+  ltx2-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ltx2-api:latest
+    container_name: ltx2-api
+    runtime: nvidia
+    environment:
+      # NVIDIA GPU settings
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+      # PyTorch memory optimization
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+      # Model paths (mount your models here)
+      - LTX_CHECKPOINT_PATH=/models/ltx-2-19b-distilled-fp8.safetensors
+      - LTX_GEMMA_ROOT=/models/gemma-3-4b-it
+      - LTX_SPATIAL_UPSAMPLER_PATH=/models/ltx-2-spatial-upsampler-x2-1.0.safetensors
+      - LTX_DISTILLED_LORA_PATH=/models/ltx-2-19b-distilled-lora.safetensors
+      - LTX_DISTILLED_LORA_STRENGTH=0.6
+
+      # Generation defaults - 9:16 1080p vertical video
+      - LTX_DEFAULT_WIDTH=1080
+      - LTX_DEFAULT_HEIGHT=1920
+      - LTX_DEFAULT_NUM_FRAMES=121
+      - LTX_DEFAULT_FRAME_RATE=25.0
+      - LTX_DEFAULT_NUM_INFERENCE_STEPS=30
+      - LTX_DEFAULT_CFG_GUIDANCE_SCALE=3.0
+
+      # Performance settings
+      - LTX_ENABLE_FP8=true
+      - LTX_MAX_CONCURRENT_JOBS=1
+
+      # HuggingFace token for model downloads (optional)
+      - HF_TOKEN=${HF_TOKEN:-}
+
+    volumes:
+      # Mount models directory - download models here before starting
+      - ./models:/models:ro
+
+      # Output directory for generated videos
+      - ./outputs:/outputs
+
+      # Temporary uploads
+      - ./tmp:/tmp/uploads
+
+    ports:
+      - "8000:8000"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+
+    restart: unless-stopped
+
+  # Optional: Model downloader service
+  model-downloader:
+    image: python:3.11-slim
+    container_name: ltx2-model-downloader
+    profiles:
+      - download
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./models:/models
+      - ./scripts:/scripts:ro
+    command: >
+      bash -c "
+        pip install huggingface_hub &&
+        python /scripts/download_models.py
+      "
