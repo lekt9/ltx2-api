@@ -46,15 +46,18 @@ RUN pip install --upgrade pip && pip install uv
 RUN git clone https://github.com/Lightricks/LTX-2.git /app/LTX-2
 
 # Install PyTorch with CUDA support first (pinned compatible versions)
-RUN pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install xformers for memory optimization (before ltx packages to avoid conflicts)
+RUN pip install xformers --index-url https://download.pytorch.org/whl/cu124
 
 # Install LTX-2 packages
 WORKDIR /app/LTX-2
 RUN pip install -e packages/ltx-core && \
     pip install -e packages/ltx-pipelines
 
-# Install xformers for memory optimization
-RUN pip install xformers --index-url https://download.pytorch.org/whl/cu124
+# Reinstall torchaudio AFTER all other deps to ensure ABI compatibility with torch
+RUN pip install --force-reinstall torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install API dependencies
 RUN pip install \
