@@ -46,7 +46,7 @@ RUN pip install --upgrade pip && pip install uv
 RUN git clone https://github.com/Lightricks/LTX-2.git /app/LTX-2
 
 # Install PyTorch with CUDA support first
-RUN pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+RUN pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # Install LTX-2 packages
 WORKDIR /app/LTX-2
