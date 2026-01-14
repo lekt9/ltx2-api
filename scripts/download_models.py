@@ -38,8 +38,8 @@ CHECKPOINTS = {
 
 # Required additional models
 ADDITIONAL_MODELS = [
-    "ltx-2-spatial-upsampler-x2-1.0.safetensors",
-    "ltx-2-19b-distilled-lora.safetensors",
+    "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+    "ltx-2-19b-distilled-lora-384.safetensors",
 ]
 
 # Gemma-3 text encoder

@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     # Model paths
     checkpoint_path: str = "/models/ltx-2-19b-distilled-fp8.safetensors"
     gemma_root: str = "/models/gemma-3-4b-it"
-    spatial_upsampler_path: str = "/models/ltx-2-spatial-upsampler-x2-1.0.safetensors"
-    distilled_lora_path: str = "/models/ltx-2-19b-distilled-lora.safetensors"
+    spatial_upsampler_path: str = "/models/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    distilled_lora_path: str = "/models/ltx-2-19b-distilled-lora-384.safetensors"
     distilled_lora_strength: float = 0.6
 
     # Generation defaults - 9:16 aspect ratio for 1080p vertical video
