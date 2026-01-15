@@ -24,9 +24,9 @@ services:
       - LTX_DISTILLED_LORA_STRENGTH=0.6
 
       # Generation defaults - 9:16 vertical (dimensions must be divisible by 64)
-      # 512x896 base + 2x upscale = 1024x1792 final output
-      - LTX_DEFAULT_WIDTH=512
-      - LTX_DEFAULT_HEIGHT=896
+      # 384x672 base + 2x upscale = 768x1344 final output
+      - LTX_DEFAULT_WIDTH=384
+      - LTX_DEFAULT_HEIGHT=672
       - LTX_DEFAULT_NUM_FRAMES=25
       - LTX_DEFAULT_FRAME_RATE=25.0
       - LTX_DEFAULT_NUM_INFERENCE_STEPS=40
