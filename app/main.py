@@ -258,13 +258,19 @@ def _run_pipeline_sync(
 ):
     """Synchronous pipeline execution for running in executor."""
     import gc
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+    from ltx_pipelines.utils.media_io import encode_video
 
     # Prepare image conditioning: (path, frame_index, strength)
     images = [(image_path, request.image_frame, request.image_strength)]
 
-    # Run the one-stage pipeline
-    # TI2VidOneStagePipeline writes directly to output_path
-    pipeline(
+    # Configure tiling for memory efficiency
+    tiling_config = TilingConfig.default()
+    video_chunks_number = get_video_chunks_number(request.num_frames, tiling_config)
+
+    # Run the pipeline - returns (video_iterator, audio_tensor)
+    video_iter, audio = pipeline(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
         seed=seed,
@@ -275,14 +281,24 @@ def _run_pipeline_sync(
         num_inference_steps=request.num_inference_steps,
         cfg_guidance_scale=request.cfg_guidance_scale,
         images=images,
+        tiling_config=tiling_config,
         enhance_prompt=request.enhance_prompt,
-        output_path=output_path,
     )
 
-    # Clear CUDA cache after generation
+    # Clear CUDA cache before encoding to free memory
     gc.collect()
     torch.cuda.empty_cache()
     logger.info(f"GPU memory after generation: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
+
+    # Encode the video to MP4
+    encode_video(
+        video=video_iter,
+        fps=int(request.frame_rate),
+        audio=audio,
+        audio_sample_rate=AUDIO_SAMPLE_RATE,
+        output_path=output_path,
+        video_chunks_number=video_chunks_number,
+    )
 
     return output_path
 
