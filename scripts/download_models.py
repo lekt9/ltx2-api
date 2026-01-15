@@ -42,8 +42,8 @@ ADDITIONAL_MODELS = [
     "ltx-2-19b-distilled-lora-384.safetensors",
 ]
 
-# Gemma-3 text encoder
-GEMMA_REPO = "google/gemma-3-4b-it"
+# Gemma-3 text encoder (12B required for LTX-2 compatibility)
+GEMMA_REPO = "google/gemma-3-12b-it"
 
 
 def download_ltx2_models(models_dir: Path, checkpoint_type: str = "distilled-fp8"):
@@ -90,7 +90,7 @@ def download_ltx2_models(models_dir: Path, checkpoint_type: str = "distilled-fp8
             # Continue with other models
 
     # Download Gemma-3 text encoder
-    gemma_dir = models_dir / "gemma-3-4b-it"
+    gemma_dir = models_dir / "gemma-3-12b-it"
     print(f"\n[3/3] Downloading Gemma-3 text encoder...")
     print(f"      Repository: {GEMMA_REPO}")
 
