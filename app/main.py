@@ -1,8 +1,9 @@
 """
 LTX-2 Image-to-Video API Server
 
-FastAPI server for generating 9:16 1080p (1080x1920) videos from images
-using the LTX-2 model.
+FastAPI server for generating 9:16 vertical videos from images using the LTX-2 model.
+Uses TI2VidTwoStagesPipeline for production-quality output with 2x spatial upsampling.
+Dimensions must be divisible by 64 for the two-stage pipeline.
 """
 
 import asyncio
@@ -39,14 +40,16 @@ class Settings(BaseSettings):
 
     # Model paths
     checkpoint_path: str = "/models/ltx-2-19b-distilled-fp8.safetensors"
-    gemma_root: str = "/models/gemma-3-4b-it"
+    gemma_root: str = "/models/gemma-3-12b-it"
     spatial_upsampler_path: str = "/models/ltx-2-spatial-upscaler-x2-1.0.safetensors"
     distilled_lora_path: str = "/models/ltx-2-19b-distilled-lora-384.safetensors"
     distilled_lora_strength: float = 0.6
 
-    # Generation defaults - 9:16 aspect ratio for 1080p vertical video
-    default_width: int = 1080
-    default_height: int = 1920
+    # Generation defaults - 9:16 aspect ratio for vertical video
+    # Note: dimensions must be divisible by 64 for two-stage pipeline
+    # 512x896 base + 2x upscale = 1024x1792 final output (fits in 80GB VRAM)
+    default_width: int = 512  # 512/64 = 8
+    default_height: int = 896  # 896/64 = 14 (maintains ~9:16 ratio)
     default_num_frames: int = 121  # ~5 seconds at 25fps
     default_frame_rate: float = 25.0
     default_num_inference_steps: int = 30
@@ -122,13 +125,11 @@ def load_pipeline():
     logger.info("Loading LTX-2 pipeline...")
 
     try:
-        from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-
         # Check if all model files exist
         required_files = [
             settings.checkpoint_path,
             settings.spatial_upsampler_path,
+            settings.distilled_lora_path,
         ]
 
         for f in required_files:
@@ -138,19 +139,26 @@ def load_pipeline():
         if not Path(settings.gemma_root).exists():
             raise FileNotFoundError(f"Gemma model directory not found: {settings.gemma_root}")
 
-        # Configure distilled LoRA
-        distilled_lora = []
-        if Path(settings.distilled_lora_path).exists():
-            distilled_lora = [
-                LoraPathStrengthAndSDOps(
-                    settings.distilled_lora_path,
-                    settings.distilled_lora_strength,
-                    LTXV_LORA_COMFY_RENAMING_MAP,
-                ),
-            ]
-            logger.info(f"Loaded distilled LoRA from {settings.distilled_lora_path}")
+        # Use TI2VidTwoStagesPipeline for production-quality output
+        from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
-        # Initialize pipeline
+        # Configure distilled LoRA for stage 2 refinement
+        distilled_lora = [
+            LoraPathStrengthAndSDOps(
+                settings.distilled_lora_path,
+                settings.distilled_lora_strength,
+                LTXV_LORA_COMFY_RENAMING_MAP,
+            ),
+        ]
+
+        logger.info("Using TI2VidTwoStagesPipeline (production quality with 2x upsampling)")
+        logger.info(f"  Checkpoint: {settings.checkpoint_path}")
+        logger.info(f"  Spatial upsampler: {settings.spatial_upsampler_path}")
+        logger.info(f"  Distilled LoRA: {settings.distilled_lora_path} (strength: {settings.distilled_lora_strength})")
+        logger.info(f"  Gemma: {settings.gemma_root}")
+        logger.info(f"  FP8 enabled: {settings.enable_fp8}")
+
         pipeline = TI2VidTwoStagesPipeline(
             checkpoint_path=settings.checkpoint_path,
             distilled_lora=distilled_lora,
@@ -205,7 +213,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LTX-2 Image-to-Video API",
-    description="Generate 9:16 1080p videos from images using LTX-2",
+    description="Generate 9:16 vertical videos from images using LTX-2",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -245,7 +253,7 @@ async def root():
     return {
         "name": "LTX-2 Image-to-Video API",
         "version": "1.0.0",
-        "description": "Generate 9:16 1080p videos from images",
+        "description": "Generate 9:16 vertical videos from images",
         "endpoints": {
             "POST /generate": "Generate video from image",
             "GET /jobs/{job_id}": "Check job status",
@@ -253,7 +261,9 @@ async def root():
             "GET /health": "Health check",
         },
         "default_settings": {
-            "resolution": f"{settings.default_width}x{settings.default_height}",
+            "base_resolution": f"{settings.default_width}x{settings.default_height}",
+            "output_resolution": f"{settings.default_width * 2}x{settings.default_height * 2}",
+            "upscale_factor": "2x",
             "aspect_ratio": "9:16",
             "num_frames": settings.default_num_frames,
             "frame_rate": settings.default_frame_rate,
@@ -269,19 +279,13 @@ def _run_pipeline_sync(
     seed: int,
 ):
     """Synchronous pipeline execution for running in executor."""
-    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-    from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
-    from ltx_pipelines.utils.media_io import encode_video
-
-    # Prepare image conditioning
+    # Prepare image conditioning: (path, frame_index, strength)
     images = [(image_path, request.image_frame, request.image_strength)]
 
-    # Configure tiling for memory efficiency
-    tiling_config = TilingConfig.default()
-    video_chunks_number = get_video_chunks_number(request.num_frames, tiling_config)
-
-    # Run the pipeline - returns (video_iterator, audio_tensor)
-    video, audio = pipeline(
+    # Run the two-stage pipeline - handles encoding internally
+    # Stage 1: Generate at base resolution with CFG guidance
+    # Stage 2: 2x spatial upsampling with distilled LoRA refinement
+    pipeline(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
         seed=seed,
@@ -292,18 +296,8 @@ def _run_pipeline_sync(
         num_inference_steps=request.num_inference_steps,
         cfg_guidance_scale=request.cfg_guidance_scale,
         images=images,
-        tiling_config=tiling_config,
         enhance_prompt=request.enhance_prompt,
-    )
-
-    # Encode the video to MP4
-    encode_video(
-        video=video,
-        fps=int(request.frame_rate),
-        audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
         output_path=output_path,
-        video_chunks_number=video_chunks_number,
     )
 
     return output_path
@@ -333,12 +327,9 @@ async def run_generation(
         # Run generation
         logger.info(f"Generating video: {request.width}x{request.height}, {request.num_frames} frames")
 
-        # Run in executor to not block event loop
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: _run_pipeline_sync(image_path, output_path, request, seed),
-        )
+        # Run synchronously - the pipeline handles its own threading
+        # Using executor causes issues with torch.inference_mode() context
+        _run_pipeline_sync(image_path, output_path, request, seed)
 
         # Update job status
         jobs[job_id].status = "completed"
@@ -347,7 +338,9 @@ async def run_generation(
         logger.info(f"Generation completed for job {job_id}")
 
     except Exception as e:
-        logger.error(f"Generation failed for job {job_id}: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Generation failed for job {job_id}: {e}\n{tb}")
         jobs[job_id].status = "failed"
         jobs[job_id].error = str(e)
         jobs[job_id].completed_at = datetime.utcnow().isoformat()
@@ -387,7 +380,12 @@ async def generate_video(
     """
     Generate a video from an input image.
 
-    Default settings produce 9:16 1080p (1080x1920) vertical video at 25fps.
+    Uses TI2VidTwoStagesPipeline for production quality:
+    - Stage 1: Generate at base resolution (e.g., 512x896)
+    - Stage 2: 2x spatial upsampling (e.g., 1024x1792 output)
+
+    Default settings produce 9:16 vertical video at 25fps.
+    Note: dimensions must be divisible by 64 for the two-stage pipeline.
     """
     if pipeline is None:
         raise HTTPException(
