@@ -258,16 +258,11 @@ def _run_pipeline_sync(
 ):
     """Synchronous pipeline execution for running in executor."""
     import gc
-    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
     from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
     from ltx_pipelines.utils.media_io import encode_video
 
     # Prepare image conditioning: (path, frame_index, strength)
     images = [(image_path, request.image_frame, request.image_strength)]
-
-    # Configure tiling for memory efficiency
-    tiling_config = TilingConfig.default()
-    video_chunks_number = get_video_chunks_number(request.num_frames, tiling_config)
 
     # Run the pipeline - returns (video_iterator, audio_tensor)
     video_iter, audio = pipeline(
@@ -281,7 +276,6 @@ def _run_pipeline_sync(
         num_inference_steps=request.num_inference_steps,
         cfg_guidance_scale=request.cfg_guidance_scale,
         images=images,
-        tiling_config=tiling_config,
         enhance_prompt=request.enhance_prompt,
     )
 
@@ -291,6 +285,8 @@ def _run_pipeline_sync(
     logger.info(f"GPU memory after generation: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
 
     # Encode the video to MP4
+    # Calculate video chunks based on frames
+    video_chunks_number = (request.num_frames + 23) // 24  # Approximate chunk calculation
     encode_video(
         video=video_iter,
         fps=int(request.frame_rate),
