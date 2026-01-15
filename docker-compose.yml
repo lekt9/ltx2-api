@@ -25,8 +25,8 @@ services:
 
       # Generation defaults - 9:16 vertical (dimensions must be divisible by 64)
       # Using one-stage pipeline (no upsampling) for stability
-      - LTX_DEFAULT_WIDTH=768
-      - LTX_DEFAULT_HEIGHT=1344
+      - LTX_DEFAULT_WIDTH=512
+      - LTX_DEFAULT_HEIGHT=896
       - LTX_DEFAULT_NUM_FRAMES=25
       - LTX_DEFAULT_FRAME_RATE=25.0
       - LTX_DEFAULT_NUM_INFERENCE_STEPS=40
