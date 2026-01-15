@@ -279,13 +279,22 @@ def _run_pipeline_sync(
     seed: int,
 ):
     """Synchronous pipeline execution for running in executor."""
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+    from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+    from ltx_pipelines.utils.media_io import encode_video
+
     # Prepare image conditioning: (path, frame_index, strength)
     images = [(image_path, request.image_frame, request.image_strength)]
 
-    # Run the two-stage pipeline - handles encoding internally
+    # Configure tiling for memory efficiency
+    tiling_config = TilingConfig.default()
+    video_chunks_number = get_video_chunks_number(request.num_frames, tiling_config)
+
+    # Run the two-stage pipeline
     # Stage 1: Generate at base resolution with CFG guidance
     # Stage 2: 2x spatial upsampling with distilled LoRA refinement
-    pipeline(
+    # Returns (video_iterator, audio_tensor)
+    video_iter, audio = pipeline(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
         seed=seed,
@@ -296,8 +305,18 @@ def _run_pipeline_sync(
         num_inference_steps=request.num_inference_steps,
         cfg_guidance_scale=request.cfg_guidance_scale,
         images=images,
+        tiling_config=tiling_config,
         enhance_prompt=request.enhance_prompt,
+    )
+
+    # Encode the video to MP4
+    encode_video(
+        video=video_iter,
+        fps=int(request.frame_rate),
+        audio=audio,
+        audio_sample_rate=AUDIO_SAMPLE_RATE,
         output_path=output_path,
+        video_chunks_number=video_chunks_number,
     )
 
     return output_path
