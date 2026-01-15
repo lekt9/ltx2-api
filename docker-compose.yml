@@ -25,11 +25,12 @@ services:
 
       # Generation defaults - 9:16 vertical (dimensions must be divisible by 64)
       # Using one-stage pipeline (no upsampling) for stability
-      - LTX_DEFAULT_WIDTH=512
-      - LTX_DEFAULT_HEIGHT=896
-      - LTX_DEFAULT_NUM_FRAMES=25
+      # Minimal settings for 80GB VRAM
+      - LTX_DEFAULT_WIDTH=384
+      - LTX_DEFAULT_HEIGHT=640
+      - LTX_DEFAULT_NUM_FRAMES=9
       - LTX_DEFAULT_FRAME_RATE=25.0
-      - LTX_DEFAULT_NUM_INFERENCE_STEPS=40
+      - LTX_DEFAULT_NUM_INFERENCE_STEPS=20
       - LTX_DEFAULT_CFG_GUIDANCE_SCALE=3.5
 
       # Performance settings
