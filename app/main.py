@@ -125,24 +125,44 @@ def load_pipeline():
     logger.info("Loading LTX-2 pipeline...")
 
     try:
-        # Check if checkpoint exists
-        if not Path(settings.checkpoint_path).exists():
-            raise FileNotFoundError(f"Checkpoint not found: {settings.checkpoint_path}")
+        # Check if all model files exist
+        required_files = [
+            settings.checkpoint_path,
+            settings.spatial_upsampler_path,
+            settings.distilled_lora_path,
+        ]
+
+        for f in required_files:
+            if not Path(f).exists():
+                raise FileNotFoundError(f"Required model file not found: {f}")
 
         if not Path(settings.gemma_root).exists():
             raise FileNotFoundError(f"Gemma model directory not found: {settings.gemma_root}")
 
-        # Use TI2VidOneStagePipeline for stable operation
-        # (TI2VidTwoStagesPipeline crashes during spatial upsampling on H100)
-        from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
+        # Use TI2VidTwoStagesPipeline for production-quality output
+        from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
-        logger.info("Using TI2VidOneStagePipeline (stable, no upsampling)")
+        # Configure distilled LoRA for stage 2 refinement
+        distilled_lora = [
+            LoraPathStrengthAndSDOps(
+                settings.distilled_lora_path,
+                settings.distilled_lora_strength,
+                LTXV_LORA_COMFY_RENAMING_MAP,
+            ),
+        ]
+
+        logger.info("Using TI2VidTwoStagesPipeline (with 2x upsampling)")
         logger.info(f"  Checkpoint: {settings.checkpoint_path}")
+        logger.info(f"  Spatial upsampler: {settings.spatial_upsampler_path}")
+        logger.info(f"  Distilled LoRA: {settings.distilled_lora_path} (strength: {settings.distilled_lora_strength})")
         logger.info(f"  Gemma: {settings.gemma_root}")
         logger.info(f"  FP8 enabled: {settings.enable_fp8}")
 
-        pipeline = TI2VidOneStagePipeline(
+        pipeline = TI2VidTwoStagesPipeline(
             checkpoint_path=settings.checkpoint_path,
+            distilled_lora=distilled_lora,
+            spatial_upsampler_path=settings.spatial_upsampler_path,
             gemma_root=settings.gemma_root,
             loras=[],
             fp8transformer=settings.enable_fp8,
@@ -258,13 +278,21 @@ def _run_pipeline_sync(
 ):
     """Synchronous pipeline execution for running in executor."""
     import gc
+    from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
     from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
     from ltx_pipelines.utils.media_io import encode_video
 
     # Prepare image conditioning: (path, frame_index, strength)
     images = [(image_path, request.image_frame, request.image_strength)]
 
-    # Run the pipeline - returns (video_iterator, audio_tensor)
+    # Configure tiling for memory efficiency
+    tiling_config = TilingConfig.default()
+    video_chunks_number = get_video_chunks_number(request.num_frames, tiling_config)
+
+    # Run the two-stage pipeline
+    # Stage 1: Generate at half resolution with CFG guidance
+    # Stage 2: 2x spatial upsampling with distilled LoRA refinement
+    # Returns (video_iterator, audio_tensor)
     video_iter, audio = pipeline(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
@@ -276,6 +304,7 @@ def _run_pipeline_sync(
         num_inference_steps=request.num_inference_steps,
         cfg_guidance_scale=request.cfg_guidance_scale,
         images=images,
+        tiling_config=tiling_config,
         enhance_prompt=request.enhance_prompt,
     )
 
@@ -285,8 +314,6 @@ def _run_pipeline_sync(
     logger.info(f"GPU memory after generation: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
 
     # Encode the video to MP4
-    # Calculate video chunks based on frames
-    video_chunks_number = (request.num_frames + 23) // 24  # Approximate chunk calculation
     encode_video(
         video=video_iter,
         fps=int(request.frame_rate),

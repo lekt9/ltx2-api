@@ -24,10 +24,10 @@ services:
       - LTX_DISTILLED_LORA_STRENGTH=0.6
 
       # Generation defaults - 9:16 vertical (dimensions must be divisible by 64)
-      # Using one-stage pipeline (no upsampling) for stability
-      # Minimal settings for 80GB VRAM
-      - LTX_DEFAULT_WIDTH=384
-      - LTX_DEFAULT_HEIGHT=640
+      # Two-stage pipeline: base resolution -> 2x upscale
+      # 256x448 base -> 512x896 output (minimal for 80GB VRAM)
+      - LTX_DEFAULT_WIDTH=256
+      - LTX_DEFAULT_HEIGHT=448
       - LTX_DEFAULT_NUM_FRAMES=9
       - LTX_DEFAULT_FRAME_RATE=25.0
       - LTX_DEFAULT_NUM_INFERENCE_STEPS=20
