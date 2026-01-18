@@ -8,8 +8,8 @@ Input format:
     "input": {
         "prompt": "A cat playing piano",
         "negative_prompt": "blurry, low quality",  # optional
-        "width": 1280,           # optional, default 1280
-        "height": 720,           # optional, default 720
+        "width": 768,            # optional, default 768
+        "height": 512,           # optional, default 512
         "num_frames": 97,        # optional, default 97 (~4 seconds at 24fps)
         "fps": 24,               # optional, default 24
         "guidance_scale": 7.5,   # optional, default 7.5
@@ -22,13 +22,14 @@ Output format:
 {
     "video": "base64_encoded_mp4_data",
     "duration_seconds": 4.04,
-    "resolution": "1280x720",
+    "resolution": "768x512",
     "seed": 12345
 }
 """
 
 import base64
 import os
+import subprocess
 import tempfile
 import time
 from typing import Optional
@@ -51,30 +52,13 @@ def load_pipeline():
     print("Loading LTX-2 pipeline...")
     start = time.time()
 
-    # Import here to avoid loading at module level
-    from ltx_pipelines import LTXTextToVideoPipeline
+    from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 
-    # Use FP16 for speed, or FP8 if available
-    dtype = torch.float16
-
-    # Check for FP8 support (RTX 40/50 series, H100)
-    if torch.cuda.is_available():
-        compute_capability = torch.cuda.get_device_capability()
-        if compute_capability[0] >= 9:  # H100, etc.
-            try:
-                dtype = torch.float8_e4m3fn
-                print("Using FP8 precision (H100 detected)")
-            except:
-                pass
-
-    PIPELINE = LTXTextToVideoPipeline.from_pretrained(
+    PIPELINE = TI2VidOneStagePipeline.from_pretrained(
         "Lightricks/LTX-2",
-        torch_dtype=dtype,
+        torch_dtype=torch.bfloat16,
     )
     PIPELINE.to("cuda")
-
-    # Enable memory optimizations
-    PIPELINE.enable_model_cpu_offload()
 
     print(f"Pipeline loaded in {time.time() - start:.1f}s")
     return PIPELINE
@@ -83,8 +67,8 @@ def load_pipeline():
 def generate_video(
     prompt: str,
     negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    width: int = 1280,
-    height: int = 720,
+    width: int = 768,
+    height: int = 512,
     num_frames: int = 97,
     fps: int = 24,
     guidance_scale: float = 7.5,
@@ -121,51 +105,49 @@ def generate_video(
     generation_time = time.time() - start
     print(f"Generation completed in {generation_time:.1f}s")
 
-    # Get video frames
-    video_frames = output.frames[0]  # Shape: (num_frames, height, width, 3)
+    # Get video frames - output.frames is a list of PIL images or tensors
+    frames = output.frames
 
-    # Save to temporary MP4
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        temp_path = f.name
+    # Create temporary directory for frames
+    with tempfile.TemporaryDirectory() as tmpdir:
+        frame_pattern = os.path.join(tmpdir, "frame_%04d.png")
+        output_path = os.path.join(tmpdir, "output.mp4")
 
-    # Export to MP4 using imageio or similar
-    try:
-        import imageio
-        writer = imageio.get_writer(temp_path, fps=fps, codec="libx264", quality=8)
-        for frame in video_frames:
-            # Convert to uint8 if needed
-            if frame.max() <= 1.0:
-                frame = (frame * 255).astype("uint8")
-            writer.append_data(frame)
-        writer.close()
-    except ImportError:
-        # Fallback: use PIL and ffmpeg
-        from PIL import Image
-        import subprocess
+        # Save frames
+        for i, frame in enumerate(frames):
+            if hasattr(frame, 'save'):
+                # PIL Image
+                frame.save(frame_pattern % i)
+            else:
+                # Tensor or numpy array
+                from PIL import Image
+                import numpy as np
+                if torch.is_tensor(frame):
+                    frame = frame.cpu().numpy()
+                if frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                if frame.shape[0] in [1, 3, 4]:  # CHW format
+                    frame = frame.transpose(1, 2, 0)
+                if frame.shape[-1] == 1:
+                    frame = frame.squeeze(-1)
+                Image.fromarray(frame).save(frame_pattern % i)
 
-        frame_dir = tempfile.mkdtemp()
-        for i, frame in enumerate(video_frames):
-            if frame.max() <= 1.0:
-                frame = (frame * 255).astype("uint8")
-            img = Image.fromarray(frame)
-            img.save(f"{frame_dir}/frame_{i:04d}.png")
-
+        # Encode to MP4 using ffmpeg
         subprocess.run([
-            "ffmpeg", "-y", "-framerate", str(fps),
-            "-i", f"{frame_dir}/frame_%04d.png",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            temp_path
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", frame_pattern,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            output_path
         ], check=True, capture_output=True)
 
-    # Read and encode as base64
-    with open(temp_path, "rb") as f:
-        video_bytes = f.read()
+        # Read and encode as base64
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
 
     video_base64 = base64.b64encode(video_bytes).decode("utf-8")
-
-    # Cleanup
-    os.unlink(temp_path)
-
     duration = num_frames / fps
 
     return {
@@ -200,8 +182,8 @@ def handler(event: dict) -> dict:
         result = generate_video(
             prompt=prompt,
             negative_prompt=input_data.get("negative_prompt", "blurry, low quality, distorted, glitchy, watermark"),
-            width=input_data.get("width", 1280),
-            height=input_data.get("height", 720),
+            width=input_data.get("width", 768),
+            height=input_data.get("height", 512),
             num_frames=input_data.get("num_frames", 97),
             fps=input_data.get("fps", 24),
             guidance_scale=input_data.get("guidance_scale", 7.5),
