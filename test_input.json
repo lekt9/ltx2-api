@@ -1,0 +1,12 @@
+{
+    "input": {
+        "prompt": "A golden retriever playing fetch on a sunny beach, slow motion, cinematic lighting, 4K quality",
+        "negative_prompt": "blurry, low quality, distorted, glitchy, watermark, text",
+        "width": 1280,
+        "height": 720,
+        "num_frames": 97,
+        "fps": 24,
+        "guidance_scale": 7.5,
+        "num_inference_steps": 30
+    }
+}
