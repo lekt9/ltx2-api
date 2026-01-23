@@ -24,8 +24,14 @@ WORKDIR /app
 # Install RunPod SDK
 RUN pip install runpod
 
-# Install LTX-2 packages (use git install for latest)
-RUN pip install git+https://github.com/Lightricks/LTX-2.git
+# Install torchvision compatible with torch 2.10+ (cu128)
+RUN pip install --upgrade torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# Clone and install LTX-2 packages
+RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git /tmp/ltx2 && \
+    pip install /tmp/ltx2/packages/ltx-core && \
+    pip install /tmp/ltx2/packages/ltx-pipelines && \
+    rm -rf /tmp/ltx2
 
 # Install additional dependencies
 RUN pip install \
@@ -33,10 +39,17 @@ RUN pip install \
     imageio-ffmpeg \
     accelerate \
     safetensors \
-    huggingface_hub
+    huggingface_hub \
+    fastapi \
+    uvicorn \
+    scipy
 
-# Copy handler
+# Copy handler, server, docs, and test input
 COPY handler.py /app/handler.py
+COPY server.py /app/server.py
+COPY llms.txt /app/llms.txt
+COPY test_input.json /app/test_input.json
 
-# Set the entrypoint
-CMD ["python", "-u", "/app/handler.py"]
+# Default to HTTP server for remote access
+# Use: docker run ... python /app/handler.py  for RunPod serverless mode
+CMD ["python", "-u", "/app/server.py"]
