@@ -374,9 +374,22 @@ def generate_with_audio_conditioning(
     cfg_guidance_scale: float,
     images: list,
     audio_latent: torch.Tensor,
-    audio_noise_scale: float = 0.85,
+    audio_noise_scale: float = 0.15,
 ):
-    """Generate video with audio conditioning using internal pipeline functions."""
+    """Generate video with audio conditioning using internal pipeline functions.
+
+    The key insight: audio and video are denoised JOINTLY with cross-attention between them.
+    - audio_to_video_attn: Audio latent influences video generation
+    - video_to_audio_attn: Video latent influences audio generation
+
+    By providing an initial audio latent with LOW noise_scale, we preserve the input audio
+    information, which then guides video generation through cross-attention.
+
+    Args:
+        audio_latent: Encoded audio latent from AudioEncoder
+        audio_noise_scale: How much noise to add to audio (0=exact audio, 1=ignore audio).
+                          Lower values = stronger audio conditioning. Default 0.15.
+    """
     from ltx_core.components.diffusion_steps import EulerDiffusionStep
     from ltx_core.components.guiders import CFGGuider
     from ltx_core.components.noisers import GaussianNoiser
@@ -384,14 +397,15 @@ def generate_with_audio_conditioning(
     from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
     from ltx_core.model.video_vae import decode_video as vae_decode_video
     from ltx_core.text_encoders.gemma import encode_text
-    from ltx_core.types import VideoPixelShape
+    from ltx_core.tools import AudioLatentTools, VideoLatentTools
+    from ltx_core.types import AudioLatentShape, VideoLatentShape, VideoPixelShape
     from ltx_pipelines.utils.helpers import (
         assert_resolution,
         cleanup_memory,
-        denoise_audio_video,
         euler_denoising_loop,
         guider_denoising_func,
         image_conditionings_by_replacing_latent,
+        state_with_conditionings,
     )
 
     assert_resolution(height=height, width=width, is_two_stage=False)
@@ -443,20 +457,35 @@ def generate_with_audio_conditioning(
         device=pipeline.device,
     )
 
-    # Generate with audio conditioning
-    video_state, audio_state = denoise_audio_video(
-        output_shape=output_shape,
-        conditionings=conditionings,
-        noiser=noiser,
-        sigmas=sigmas,
-        stepper=stepper,
-        denoising_loop_fn=denoising_loop,
-        components=pipeline.pipeline_components,
-        dtype=dtype,
-        device=pipeline.device,
-        initial_audio_latent=audio_latent,
-        noise_scale=audio_noise_scale,
+    # Initialize VIDEO state with full noise (noise_scale=1.0) for text-to-video
+    video_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=output_shape,
+        latent_channels=pipeline.pipeline_components.video_latent_channels,
+        scale_factors=pipeline.pipeline_components.video_scale_factors,
     )
+    video_tools = VideoLatentTools(
+        pipeline.pipeline_components.video_patchifier, video_latent_shape, output_shape.fps
+    )
+    video_state = video_tools.create_initial_state(pipeline.device, dtype, initial_latent=None)
+    video_state = state_with_conditionings(video_state, conditionings, video_tools)
+    video_state = noiser(video_state, noise_scale=1.0)  # Full noise for video
+
+    # Initialize AUDIO state with LOW noise to preserve input audio for conditioning
+    audio_latent_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+    audio_tools = AudioLatentTools(pipeline.pipeline_components.audio_patchifier, audio_latent_shape)
+    audio_state = audio_tools.create_initial_state(pipeline.device, dtype, initial_latent=audio_latent)
+    audio_state = noiser(audio_state, noise_scale=audio_noise_scale)  # Low noise preserves audio
+
+    print(f"  Audio conditioning: noise_scale={audio_noise_scale} (lower=stronger conditioning)")
+
+    # Joint denoising - audio influences video through cross-attention
+    video_state, audio_state = denoising_loop(sigmas, video_state, audio_state, stepper)
+
+    # Unpatchify outputs
+    video_state = video_tools.clear_conditioning(video_state)
+    video_state = video_tools.unpatchify(video_state)
+    audio_state = audio_tools.clear_conditioning(audio_state)
+    audio_state = audio_tools.unpatchify(audio_state)
 
     torch.cuda.synchronize()
     del transformer
@@ -539,7 +568,7 @@ def generate_video(
                     cfg_guidance_scale=guidance_scale,
                     images=images if images else [],
                     audio_latent=audio_latent,
-                    audio_noise_scale=1.0 - audio_cond_noise_scale,
+                    audio_noise_scale=audio_cond_noise_scale,
                 )
             else:
                 video_tensor, audio_tensor = pipeline(

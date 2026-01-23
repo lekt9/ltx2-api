@@ -1,0 +1,238 @@
+# LTX-2 Video Generation API
+
+> LLM Instructions: This is an API for generating videos with synchronized audio using the LTX-2 19B model. Use POST /generate with a JSON body. Supports text-to-video, image-to-video, and audio-to-video conditioning.
+
+## Quick Start
+
+```bash
+# Simple text-to-video with audio (9:16 portrait)
+curl -X POST http://<SERVER>:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A cat sitting calmly on a cushion", "width": 288, "height": 512}'
+
+# Image-to-video
+curl -X POST http://<SERVER>:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "The scene animates with gentle movement",
+    "width": 288,
+    "height": 512,
+    "image": "data:image/png;base64,<BASE64_IMAGE>"
+  }'
+```
+
+## Audio Capabilities
+
+| Feature | Status |
+|---------|--------|
+| Audio OUTPUT | YES - generates synchronized audio (24kHz stereo) |
+| Audio INPUT | YES - conditions video generation via cross-attention |
+
+The model jointly generates video AND audio. Audio and video influence each other through bidirectional cross-attention layers in the transformer.
+
+### Audio-to-Video Conditioning
+
+Audio input works through the model's cross-attention mechanism:
+1. Input audio is encoded to latent space via AudioEncoder
+2. Audio latent is initialized with LOW noise (preserving the audio)
+3. Video latent is initialized with FULL noise (standard generation)
+4. During denoising, `audio_to_video_attn` allows audio to guide video generation
+5. The result is a video that reflects the input audio's characteristics
+
+```bash
+# Convert audio to base64
+AUDIO_B64=$(base64 -w0 input.wav)
+
+# Generate video conditioned on audio
+curl -X POST http://<SERVER>:8000/generate \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"A person speaking in front of a camera\",
+    \"width\": 288,
+    \"height\": 512,
+    \"audio\": \"data:audio/wav;base64,$AUDIO_B64\",
+    \"audio_cond_noise_scale\": 0.15
+  }"
+```
+
+**Audio Input Requirements:**
+- Format: WAV file (base64-encoded)
+- Sample rate: Any (resampled internally to 16kHz)
+- Channels: Mono or stereo
+- Length: Any duration (automatically resampled to match video length)
+
+**Conditioning Strength:**
+- `audio_cond_noise_scale=0.0` - Exact audio preservation (strongest conditioning)
+- `audio_cond_noise_scale=0.15` - Default, strong conditioning
+- `audio_cond_noise_scale=0.5` - Moderate conditioning
+- `audio_cond_noise_scale=1.0` - Audio ignored (equivalent to text-to-video)
+
+## API Reference
+
+### Endpoint
+```
+POST /generate
+Content-Type: application/json
+```
+
+### Request Body
+
+```json
+{
+  "prompt": "required - describe the video and any speech/sounds",
+  "negative_prompt": "blurry, low quality, distorted, glitchy, watermark",
+  "width": 288,
+  "height": 512,
+  "num_frames": 121,
+  "fps": 25,
+  "guidance_scale": 3.0,
+  "num_inference_steps": 40,
+  "seed": null,
+  "image": null,
+  "image_cond_noise_scale": 0.15,
+  "include_audio": true,
+  "audio": null,
+  "audio_cond_noise_scale": 0.15
+}
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | required | Video description. Include "A person speaking: [dialogue]" for speech |
+| `negative_prompt` | string | "blurry..." | What to avoid |
+| `width` | int | 768 | Must be divisible by 32 (recommend 288 for 9:16) |
+| `height` | int | 512 | Must be divisible by 32 |
+| `num_frames` | int | 121 | Number of frames (~5 sec at 25fps) |
+| `fps` | int | 25 | Frame rate |
+| `guidance_scale` | float | 3.0 | CFG scale (1.0 disables CFG, 3.0 recommended) |
+| `num_inference_steps` | int | 40 | Quality steps (20-50, higher = better quality) |
+| `seed` | int | random | For reproducibility |
+| `image` | string | null | Base64 image for image-to-video mode |
+| `image_cond_noise_scale` | float | 0.15 | How much to deviate from source image (0=exact, 1=ignore) |
+| `include_audio` | bool | true | Include generated audio in output |
+| `audio` | string | null | Base64 WAV audio for audio-to-video conditioning |
+| `audio_cond_noise_scale` | float | 0.15 | Audio noise level (0=exact audio, 1=ignore audio) |
+
+### Response
+
+```json
+{
+  "video": "data:video/mp4;base64,...",
+  "duration_seconds": 4.84,
+  "resolution": "288x512",
+  "fps": 25,
+  "seed": 1234567890,
+  "generation_time_seconds": 27.72,
+  "mode": "text-to-video | image-to-video | audio-to-video",
+  "has_audio": true
+}
+```
+
+## Performance Benchmarks
+
+Tested on NVIDIA B200 (178GB VRAM):
+
+| Frames | Resolution | Steps | Duration | Gen Time | Mode |
+|--------|------------|-------|----------|----------|------|
+| 9 | 288x512 | 5 | 0.36s | ~13s | text |
+| 25 | 288x512 | 20 | 1.0s | ~18s | text |
+| 25 | 288x512 | 20 | 1.0s | ~18s | audio |
+| 49 | 288x512 | 30 | 1.96s | ~21s | text |
+| 121 | 288x512 | 40 | 4.84s | ~28s | text |
+
+## Model Architecture
+
+**How audio conditioning works:**
+```
+Input Audio --> AudioEncoder --> Audio Latent (low noise)
+                                      |
+                                      v
+Text Prompt --> TextEncoder --> [Transformer with Cross-Attention]
+                                      |
+                                      ├── audio_to_video_attn: Audio guides video
+                                      └── video_to_audio_attn: Video guides audio
+                                      |
+                                      v
+                               Video + Audio Output
+```
+
+The transformer has bidirectional cross-attention:
+- `audio_to_video_attn`: Q=Video, K/V=Audio - audio influences video generation
+- `video_to_audio_attn`: Q=Audio, K/V=Video - video influences audio generation
+
+## Model Info
+
+- **Model**: Lightricks/LTX-2 (19B parameters)
+- **Checkpoint**: `ltx-2-19b-distilled-fp8.safetensors` (distilled, FP8 quantized)
+- **Architecture**: DiT (Diffusion Transformer) with dual video/audio streams
+- **Audio**: 24kHz stereo, HiFi-GAN vocoder
+- **Text Encoder**: Gemma 3 (13B parameters)
+- **Video Format**: H.264/AAC in MP4 container
+
+## Python Client
+
+```python
+import requests
+import base64
+
+def generate_video(prompt, server="http://localhost:8000",
+                   width=288, height=512, num_frames=49,
+                   steps=30, image_path=None, audio_path=None,
+                   audio_noise_scale=0.15):
+    payload = {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "num_inference_steps": steps,
+        "include_audio": True,
+    }
+
+    if image_path:
+        with open(image_path, "rb") as f:
+            payload["image"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+
+    if audio_path:
+        with open(audio_path, "rb") as f:
+            payload["audio"] = f"data:audio/wav;base64,{base64.b64encode(f.read()).decode()}"
+            payload["audio_cond_noise_scale"] = audio_noise_scale
+
+    response = requests.post(f"{server}/generate", json=payload, timeout=300)
+    result = response.json()
+
+    if "error" in result or "detail" in result:
+        raise Exception(result.get("error") or result.get("detail"))
+
+    # Save video
+    video_data = result["video"].split(",")[1]
+    with open("output.mp4", "wb") as f:
+        f.write(base64.b64decode(video_data))
+
+    print(f"Mode: {result['mode']}")
+    print(f"Duration: {result['duration_seconds']}s")
+    print(f"Generation time: {result['generation_time_seconds']}s")
+
+    return result
+
+# Text-to-video
+generate_video("A cat sitting calmly on a cushion")
+
+# Audio-to-video (audio guides video through cross-attention)
+generate_video("A person speaking", audio_path="speech.wav", audio_noise_scale=0.15)
+```
+
+## Docker
+
+```bash
+# Build
+docker build -t ltx2-worker .
+
+# Run
+docker run -d --gpus all --name ltx2-server -p 8000:8000 \
+  -v /runpod-volume:/runpod-volume ltx2-worker python /app/server.py
+
+# Logs
+docker logs -f ltx2-server
+```
