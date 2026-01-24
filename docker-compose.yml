@@ -1,0 +1,106 @@
+version: "3.8"
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    ports:
+      - "8000:8080"
+    environment:
+      - WORKER_URLS=http://worker-1:8000,http://worker-2:8000,http://worker-3:8000,http://worker-4:8000
+      - MAX_QUEUE_SIZE=100
+      - REQUEST_TIMEOUT=600
+      - HEALTH_CHECK_INTERVAL=10
+    depends_on:
+      - worker-1
+      - worker-2
+      - worker-3
+      - worker-4
+    restart: unless-stopped
+    networks:
+      - ltx-network
+
+  worker-1:
+    build: .
+    command: python /app/server.py
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_HOME=/runpod-volume/huggingface
+      - TRANSFORMERS_CACHE=/runpod-volume/huggingface
+    volumes:
+      - /runpod-volume:/runpod-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - ltx-network
+
+  worker-2:
+    build: .
+    command: python /app/server.py
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_HOME=/runpod-volume/huggingface
+      - TRANSFORMERS_CACHE=/runpod-volume/huggingface
+    volumes:
+      - /runpod-volume:/runpod-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - ltx-network
+
+  worker-3:
+    build: .
+    command: python /app/server.py
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_HOME=/runpod-volume/huggingface
+      - TRANSFORMERS_CACHE=/runpod-volume/huggingface
+    volumes:
+      - /runpod-volume:/runpod-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - ltx-network
+
+  worker-4:
+    build: .
+    command: python /app/server.py
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_HOME=/runpod-volume/huggingface
+      - TRANSFORMERS_CACHE=/runpod-volume/huggingface
+    volumes:
+      - /runpod-volume:/runpod-volume
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - ltx-network
+
+networks:
+  ltx-network:
+    driver: bridge

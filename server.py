@@ -5,7 +5,9 @@ Provides a simple HTTP API for remote access to the video generation handler.
 Generates synchronized audio-video content.
 """
 
+import asyncio
 import os
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,9 @@ from typing import Optional
 
 # Import the handler function
 from handler import generate_video, load_pipeline
+
+# Lock to ensure only one generation at a time per worker
+generation_lock = Lock()
 
 app = FastAPI(
     title="LTX-2 Video Generation API",
@@ -111,6 +116,12 @@ async def root():
     }
 
 
+@app.get("/busy")
+async def busy():
+    """Check if worker is currently processing a request."""
+    return {"busy": generation_lock.locked()}
+
+
 @app.post("/generate", response_model=VideoResponse)
 async def generate(request: VideoRequest):
     """
@@ -126,23 +137,28 @@ async def generate(request: VideoRequest):
     Audio is generated automatically and included in the output MP4.
     Set include_audio=false to get video-only output.
     """
+    def run_generation():
+        with generation_lock:
+            return generate_video(
+                prompt=request.prompt,
+                negative_prompt=request.negative_prompt,
+                width=request.width,
+                height=request.height,
+                num_frames=request.num_frames,
+                fps=request.fps,
+                guidance_scale=request.guidance_scale,
+                num_inference_steps=request.num_inference_steps,
+                seed=request.seed,
+                image=request.image,
+                image_cond_noise_scale=request.image_cond_noise_scale,
+                include_audio=request.include_audio,
+                audio=request.audio,
+                audio_cond_noise_scale=request.audio_cond_noise_scale,
+            )
+
     try:
-        result = generate_video(
-            prompt=request.prompt,
-            negative_prompt=request.negative_prompt,
-            width=request.width,
-            height=request.height,
-            num_frames=request.num_frames,
-            fps=request.fps,
-            guidance_scale=request.guidance_scale,
-            num_inference_steps=request.num_inference_steps,
-            seed=request.seed,
-            image=request.image,
-            image_cond_noise_scale=request.image_cond_noise_scale,
-            include_audio=request.include_audio,
-            audio=request.audio,
-            audio_cond_noise_scale=request.audio_cond_noise_scale,
-        )
+        # Run in thread pool to not block the event loop
+        result = await asyncio.get_event_loop().run_in_executor(None, run_generation)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
