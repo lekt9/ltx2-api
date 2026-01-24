@@ -23,6 +23,13 @@ CACHE_DIR = os.environ.get("HF_HOME", "/runpod-volume/huggingface")
 MODEL_ID = "Lightricks/LTX-2"
 AUDIO_SAMPLE_RATE = 24000
 
+# Model selection: "distilled" (faster, fewer steps) or "full" (higher quality)
+MODEL_VARIANT = os.environ.get("MODEL_VARIANT", "distilled")
+MODEL_FILES = {
+    "distilled": ("ltx-2-19b-distilled-fp8.safetensors", True),   # (filename, fp8transformer)
+    "full": ("ltx-2-19b-dev-fp8.safetensors", True),              # (filename, fp8transformer)
+}
+
 # Global pipeline cache
 PIPELINE = None
 AUDIO_ENCODER = None
@@ -42,11 +49,15 @@ def load_pipeline():
     from huggingface_hub import hf_hub_download, snapshot_download
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 
+    # Get model filename and settings based on variant
+    model_filename, use_fp8 = MODEL_FILES.get(MODEL_VARIANT, MODEL_FILES["full"])
+    print(f"Using model variant: {MODEL_VARIANT} ({model_filename})")
+
     # Download model files
     print("Downloading LTX-2 model files...")
     checkpoint_path = hf_hub_download(
         repo_id=MODEL_ID,
-        filename="ltx-2-19b-distilled-fp8.safetensors",
+        filename=model_filename,
         cache_dir=CACHE_DIR,
     )
     gemma_root = snapshot_download(
@@ -63,7 +74,7 @@ def load_pipeline():
         checkpoint_path=checkpoint_path,
         gemma_root=gemma_root,
         loras=[],
-        fp8transformer=True,
+        fp8transformer=use_fp8,
     )
 
     print(f"Pipeline initialized in {time.time() - start:.1f}s")
@@ -86,9 +97,10 @@ def load_audio_encoder():
         AudioProcessor,
     )
 
+    model_filename, _ = MODEL_FILES.get(MODEL_VARIANT, MODEL_FILES["full"])
     checkpoint_path = hf_hub_download(
         repo_id=MODEL_ID,
-        filename="ltx-2-19b-distilled-fp8.safetensors",
+        filename=model_filename,
         cache_dir=CACHE_DIR,
     )
 
