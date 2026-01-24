@@ -79,9 +79,12 @@ def load_audio_encoder():
 
     print("Loading audio encoder...")
     from huggingface_hub import hf_hub_download
-    from safetensors.torch import load_file
-    from ltx_core.model.audio_vae.audio_vae import AudioEncoder
-    from ltx_core.model.audio_vae.audio_processor import AudioProcessor
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+    from ltx_core.model.audio_vae import (
+        AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        AudioEncoderConfigurator,
+        AudioProcessor,
+    )
 
     checkpoint_path = hf_hub_download(
         repo_id=MODEL_ID,
@@ -89,17 +92,23 @@ def load_audio_encoder():
         cache_dir=CACHE_DIR,
     )
 
-    # Load audio encoder weights
-    state_dict = load_file(checkpoint_path)
-    audio_keys = {k: v for k, v in state_dict.items() if k.startswith("audio_vae.encoder.")}
-    audio_state = {k.replace("audio_vae.encoder.", ""): v for k, v in audio_keys.items()}
-
-    AUDIO_ENCODER = AudioEncoder()
-    AUDIO_ENCODER.load_state_dict(audio_state)
-    AUDIO_ENCODER.to("cuda", torch.bfloat16)
+    # Build audio encoder using the same pattern as model_ledger
+    audio_encoder_builder = Builder(
+        model_path=checkpoint_path,
+        model_class_configurator=AudioEncoderConfigurator,
+        model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+    )
+    AUDIO_ENCODER = audio_encoder_builder.build(dtype=torch.bfloat16, device=torch.device("cuda"))
     AUDIO_ENCODER.eval()
 
-    AUDIO_PROCESSOR = AudioProcessor()
+    # Create audio processor with encoder's parameters
+    AUDIO_PROCESSOR = AudioProcessor(
+        sample_rate=AUDIO_ENCODER.sample_rate,
+        mel_bins=AUDIO_ENCODER.mel_bins,
+        mel_hop_length=AUDIO_ENCODER.mel_hop_length,
+        n_fft=AUDIO_ENCODER.n_fft,
+    ).to("cuda")
+
     print("Audio encoder loaded")
     return AUDIO_ENCODER, AUDIO_PROCESSOR
 
