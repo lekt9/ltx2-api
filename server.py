@@ -26,6 +26,7 @@ from handler import (
     DEFAULT_FPS,
     DEFAULT_GUIDANCE_SCALE,
     DEFAULT_NUM_INFERENCE_STEPS,
+    _decode_base64_image,
 )
 
 # Lock to ensure only one generation at a time per worker
@@ -64,6 +65,9 @@ class VideoRequest(BaseModel):
     audio: Optional[str] = Field(default=None, description="Base64-encoded WAV audio for audio-to-video conditioning")
     audio_strength: float = Field(default=1.0, description="Audio conditioning strength (0.0-1.0)")
     tile_size: Optional[int] = Field(default=None, description="VAE tiling size for memory optimization")
+    image_start: Optional[str] = Field(default=None, description="Base64-encoded image for first frame conditioning")
+    image_end: Optional[str] = Field(default=None, description="Base64-encoded image for last frame conditioning")
+    image_strength: float = Field(default=1.0, description="Image conditioning strength (0.0-1.0)")
 
 
 class VideoResponse(BaseModel):
@@ -75,6 +79,8 @@ class VideoResponse(BaseModel):
     seed: int
     generation_time_seconds: float
     has_audio: bool
+    has_image_start: bool = False
+    has_image_end: bool = False
 
 
 @app.on_event("startup")
@@ -156,6 +162,10 @@ async def generate(request: VideoRequest):
                     audio_base64 = audio_base64.split(",", 1)[1]
                 audio_data = base64.b64decode(audio_base64)
 
+            # Decode images if provided
+            image_start = _decode_base64_image(request.image_start)
+            image_end = _decode_base64_image(request.image_end)
+
             # Generate video
             result = generate_video(
                 prompt=request.prompt,
@@ -170,6 +180,9 @@ async def generate(request: VideoRequest):
                 audio_data=audio_data,
                 audio_strength=request.audio_strength,
                 tile_size=request.tile_size,
+                image_start=image_start,
+                image_end=image_end,
+                image_strength=request.image_strength,
             )
 
             if "error" in result:
@@ -192,6 +205,8 @@ async def generate(request: VideoRequest):
                 "seed": result["seed"],
                 "generation_time_seconds": round(result["generation_time"], 2),
                 "has_audio": request.include_audio and result.get("audio") is not None,
+                "has_image_start": image_start is not None,
+                "has_image_end": image_end is not None,
             }
 
     try:
