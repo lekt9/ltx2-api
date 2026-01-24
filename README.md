@@ -21,14 +21,25 @@ curl -X POST http://<SERVER>:8000/generate \
     "num_inference_steps": 40
   }'
 
-# Image-to-video
+# Image-to-video (start frame)
 curl -X POST http://<SERVER>:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "The scene animates with gentle movement",
     "width": 288,
     "height": 512,
-    "image": "data:image/png;base64,<BASE64_IMAGE>"
+    "image_start": "data:image/png;base64,<BASE64_IMAGE>"
+  }'
+
+# Image-to-video (start + end frame interpolation)
+curl -X POST http://<SERVER>:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Smooth transition between two scenes",
+    "width": 288,
+    "height": 512,
+    "image_start": "data:image/png;base64,<START_IMAGE>",
+    "image_end": "data:image/png;base64,<END_IMAGE>"
   }'
 ```
 
@@ -101,11 +112,12 @@ Content-Type: application/json
   "guidance_scale": 3.0,
   "num_inference_steps": 40,
   "seed": null,
-  "image": null,
-  "image_cond_noise_scale": 0.15,
+  "image_start": null,
+  "image_end": null,
+  "image_strength": 1.0,
   "include_audio": true,
   "audio": null,
-  "audio_cond_noise_scale": 0.15
+  "audio_strength": 1.0
 }
 ```
 
@@ -122,11 +134,12 @@ Content-Type: application/json
 | `guidance_scale` | float | 3.0 | CFG scale (1.0 disables CFG, 3.0 recommended) |
 | `num_inference_steps` | int | 40 | Quality steps (20-50, higher = better quality) |
 | `seed` | int | random | For reproducibility |
-| `image` | string | null | Base64 image for image-to-video mode |
-| `image_cond_noise_scale` | float | 0.15 | How much to deviate from source image (0=exact, 1=ignore) |
+| `image_start` | string | null | Base64 image for first frame conditioning |
+| `image_end` | string | null | Base64 image for last frame conditioning |
+| `image_strength` | float | 1.0 | Image conditioning strength (0.0-1.0, higher = stronger adherence) |
 | `include_audio` | bool | true | Include generated audio in output |
 | `audio` | string | null | Base64 WAV audio for audio-to-video conditioning |
-| `audio_cond_noise_scale` | float | 0.15 | How much to deviate from source audio (0=exact, 1=ignore) |
+| `audio_strength` | float | 1.0 | Audio conditioning strength (0.0-1.0) |
 
 ### Response
 
@@ -138,8 +151,9 @@ Content-Type: application/json
   "fps": 25,
   "seed": 1234567890,
   "generation_time_seconds": 27.72,
-  "mode": "text-to-video | image-to-video | audio-to-video",
-  "has_audio": true
+  "has_audio": true,
+  "has_image_start": false,
+  "has_image_end": false
 }
 ```
 
@@ -185,7 +199,8 @@ import base64
 
 def generate_video(prompt, server="http://localhost:8000",
                    width=288, height=512, num_frames=49,
-                   steps=30, image_path=None, audio_path=None):
+                   steps=30, image_start_path=None, image_end_path=None,
+                   image_strength=1.0, audio_path=None):
     payload = {
         "prompt": prompt,
         "width": width,
@@ -195,9 +210,14 @@ def generate_video(prompt, server="http://localhost:8000",
         "include_audio": True,
     }
 
-    if image_path:
-        with open(image_path, "rb") as f:
-            payload["image"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+    if image_start_path:
+        with open(image_start_path, "rb") as f:
+            payload["image_start"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+        payload["image_strength"] = image_strength
+
+    if image_end_path:
+        with open(image_end_path, "rb") as f:
+            payload["image_end"] = f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
 
     if audio_path:
         with open(audio_path, "rb") as f:
@@ -216,18 +236,24 @@ def generate_video(prompt, server="http://localhost:8000",
         f.write(base64.b64decode(video_data))
 
     print(f"Saved: {output_file}")
-    print(f"  Duration: {result['duration_seconds']}s")
     print(f"  Generation time: {result['generation_time_seconds']}s")
     print(f"  Has audio: {result['has_audio']}")
+    print(f"  Image start: {result.get('has_image_start', False)}")
+    print(f"  Image end: {result.get('has_image_end', False)}")
 
     return result
 
 # Text-to-video
 generate_video("A cat sitting calmly on a cushion, soft lighting")
 
-# Image-to-video
+# Image-to-video (start frame only)
 generate_video("The scene comes alive with gentle movement",
-               image_path="input.png")
+               image_start_path="start.png")
+
+# Image-to-video (start + end frame interpolation)
+generate_video("Smooth transition between two scenes",
+               image_start_path="start.png",
+               image_end_path="end.png")
 
 # Audio-to-video (sync video to audio input)
 generate_video("A person speaking in front of a camera",

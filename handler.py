@@ -21,6 +21,7 @@ import runpod
 import torch
 from accelerate import init_empty_weights
 from huggingface_hub import hf_hub_download
+from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import load_file
 from scipy.io import wavfile
@@ -468,6 +469,26 @@ def _build_tiling_config(tile_size: int | None, fps: float | None) -> TilingConf
     return TilingConfig(spatial_config=spatial_config, temporal_config=temporal_config)
 
 
+def _to_latent_index(frame_idx: int, stride: int) -> int:
+    """Convert pixel frame index to latent index."""
+    return int(frame_idx) // int(stride)
+
+
+def _decode_base64_image(image_data: str) -> Image.Image | None:
+    """Decode a base64 encoded image to PIL Image."""
+    if not image_data:
+        return None
+    try:
+        # Handle data URL format
+        if image_data.startswith("data:"):
+            image_data = image_data.split(",", 1)[1]
+        image_bytes = base64.b64decode(image_data)
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:
+        print(f"Warning: Failed to decode image: {e}")
+        return None
+
+
 def _collect_video_chunks(video: Iterator[torch.Tensor] | torch.Tensor) -> torch.Tensor | None:
     """Collect video chunks into a single tensor."""
     if video is None:
@@ -593,6 +614,9 @@ def generate_video(
     audio_data: bytes | None = None,
     audio_strength: float = 1.0,
     tile_size: int | None = None,
+    image_start: Image.Image | None = None,
+    image_end: Image.Image | None = None,
+    image_strength: float = 1.0,
 ) -> dict[str, Any]:
     """Generate video from text prompt."""
     global pipeline, models
@@ -621,6 +645,38 @@ def generate_video(
         if audio_latent is not None:
             audio_conditionings = [AudioConditionByLatent(audio_latent, audio_strength)]
 
+    # Build image conditioning list (following Wan2GP pattern)
+    # Latent stride is typically 8 for the video VAE temporal compression
+    latent_stride = 8
+    images = []
+    images_stage2 = []
+
+    # Clamp image_strength to valid range
+    image_strength = max(0.0, min(1.0, float(image_strength)))
+
+    if isinstance(pipeline, TI2VidTwoStagesPipeline):
+        # For two-stage pipeline, we need both images and images_stage2
+        if image_start is not None:
+            entry = (image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos")
+            images.append(entry)
+            images_stage2.append(entry)
+            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
+
+        if image_end is not None:
+            entry = (image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0)
+            images.append(entry)
+            images_stage2.append(entry)
+            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
+    else:
+        # For distilled pipeline, single images list
+        if image_start is not None:
+            images.append((image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos"))
+            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
+
+        if image_end is not None:
+            images.append((image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0))
+            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
+
     # Generate video
     print(f"Generating video: {prompt[:60]}...")
     print(f"  Resolution: {target_width}x{target_height}, Frames: {num_frames}, Seed: {seed}")
@@ -638,7 +694,8 @@ def generate_video(
             frame_rate=float(fps),
             num_inference_steps=int(num_inference_steps),
             cfg_guidance_scale=float(guidance_scale),
-            images=[],
+            images=images,
+            images_stage2=images_stage2 if images_stage2 else None,
             tiling_config=tiling_config,
             enhance_prompt=False,
             audio_conditionings=audio_conditionings,
@@ -651,7 +708,7 @@ def generate_video(
             width=target_width,
             num_frames=int(num_frames),
             frame_rate=float(fps),
-            images=[],
+            images=images,
             tiling_config=tiling_config,
             enhance_prompt=False,
             audio_conditionings=audio_conditionings,
@@ -676,8 +733,8 @@ def generate_video(
     # Trim to requested size
     video_tensor = video_tensor[:, :num_frames, :height, :width]
 
-    # Convert to numpy
-    video_np = video_tensor.float().cpu().numpy()
+    # Convert to numpy - keep as uint8 since decoder already outputs [0, 255]
+    video_np = video_tensor.cpu().numpy()
 
     # Process audio
     audio_np = None
@@ -704,7 +761,18 @@ def video_to_base64(video_np: np.ndarray, fps: float = 24.0, audio_np: np.ndarra
     """Convert video numpy array to base64 encoded MP4."""
     # Normalize video to uint8
     if video_np.dtype != np.uint8:
-        video_np = ((video_np + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+        # Check actual range and normalize accordingly
+        min_val = float(video_np.min())
+        max_val = float(video_np.max())
+        if max_val <= 1.0 and min_val >= -1.0:
+            # Range is [-1, 1]
+            video_np = ((video_np + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+        elif max_val <= 1.0 and min_val >= 0.0:
+            # Range is [0, 1]
+            video_np = (video_np * 255).clip(0, 255).astype(np.uint8)
+        else:
+            # Already in [0, 255] range (float), just convert
+            video_np = video_np.clip(0, 255).astype(np.uint8)
 
     # video_np shape: (C, T, H, W) -> (T, H, W, C)
     if video_np.shape[0] in (1, 3, 4):
@@ -789,6 +857,11 @@ def handler(event: dict) -> dict:
             audio_data = base64.b64decode(audio_base64)
         audio_strength = job_input.get("audio_strength", 1.0)
 
+        # Image conditioning (start and end frames)
+        image_start = _decode_base64_image(job_input.get("image_start"))
+        image_end = _decode_base64_image(job_input.get("image_end"))
+        image_strength = job_input.get("image_strength", 1.0)
+
         # Generate video
         result = generate_video(
             prompt=prompt,
@@ -803,6 +876,9 @@ def handler(event: dict) -> dict:
             audio_data=audio_data,
             audio_strength=audio_strength,
             tile_size=tile_size,
+            image_start=image_start,
+            image_end=image_end,
+            image_strength=image_strength,
         )
 
         if "error" in result:
@@ -825,6 +901,8 @@ def handler(event: dict) -> dict:
             "seed": result["seed"],
             "generation_time_seconds": round(result["generation_time"], 2),
             "has_audio": include_audio and result.get("audio") is not None,
+            "has_image_start": image_start is not None,
+            "has_image_end": image_end is not None,
         }
 
     except Exception as e:
