@@ -5,20 +5,32 @@
 ## Quick Start
 
 ```bash
-# Simple text-to-video with audio (9:16 portrait)
+# Simple text-to-video with audio (9:16 portrait mobile)
 curl -X POST http://<SERVER>:8000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "A cat sitting calmly on a cushion", "width": 288, "height": 512}'
 
-# Longer video with more frames
+# Best quality (mobile, ~2 seconds)
 curl -X POST http://<SERVER>:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "A cat playing piano, studio lighting",
+    "prompt": "A cat playing piano, studio lighting, camera pans slowly",
     "width": 288,
     "height": 512,
-    "num_frames": 121,
-    "num_inference_steps": 40
+    "num_frames": 49,
+    "num_inference_steps": 40,
+    "guidance_scale": 3.0
+  }'
+
+# Quick preview (test prompts fast)
+curl -X POST http://<SERVER>:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A cat playing piano",
+    "width": 288,
+    "height": 512,
+    "num_frames": 9,
+    "num_inference_steps": 5
   }'
 
 # Image-to-video (start frame)
@@ -80,16 +92,139 @@ Tested on NVIDIA B200 (178GB VRAM):
 
 | Frames | Resolution | Steps | Duration | Gen Time | File Size | Mode |
 |--------|------------|-------|----------|----------|-----------|------|
-| 9 | 288x512 | 5 | 0.36s | ~13s | ~40 KB | text |
+| 9 | 288x512 | 5 | 0.36s | ~13s | ~40 KB | text (preview) |
 | 25 | 288x512 | 20 | 1.0s | ~18s | ~100 KB | text |
-| 25 | 288x512 | 20 | 1.0s | ~18s | ~280 KB | audio |
-| 49 | 288x512 | 30 | 1.96s | ~21s | ~280 KB | text |
-| 121 | 288x512 | 40 | 4.84s | ~28s | ~800 KB | text |
+| 49 | 288x512 | 30 | 1.96s | ~21s | ~280 KB | text (balanced) ⭐ |
+| 49 | 288x512 | 40 | 1.96s | ~28s | ~280 KB | text (best quality) ⭐ |
+| 121 | 288x512 | 40 | 4.84s | ~28s | ~800 KB | text (long) |
+
+**Recommended Defaults:**
+- **Mobile/TikTok:** width=288, height=512, frames=49, steps=40, guidance=3.0
+- **Quick Preview:** frames=9, steps=5
+- **Long Video:** frames=121, steps=40
 
 **Memory Usage:**
 - Peak GPU memory: ~31GB during inference
 - Model checkpoint: ~19GB (FP8 quantized)
 - Text encoder (Gemma 3): ~27GB (loaded/unloaded per request)
+
+## Best Practices for Quality
+
+### 1. Resolution for Your Use Case
+| Use Case | Width | Height | Notes |
+|----------|-------|--------|-------|
+| TikTok/Shorts | 288 | 512 | **Recommended** - 9:16 portrait |
+| HD Mobile | 384 | 672 | Higher quality mobile |
+| YouTube/Landscape | 768 | 432 | 16:9 landscape |
+| Instagram | 512 | 512 | 1:1 square |
+
+### 2. Frame Count & Duration
+| Frames | Duration | Use Case |
+|--------|----------|----------|
+| 9 | 0.36s | **Quick preview/test prompts** |
+| 25 | 1.0s | Short clips, fast testing |
+| 49 | 1.96s | **Balanced quality/speed** ⭐ |
+| 121 | 4.84s | Long clips, maximum quality |
+
+### 3. Inference Steps (Quality vs Speed)
+| Steps | Quality | Speed | Use Case |
+|-------|---------|-------|----------|
+| 5 | Low | Fast (~13s) | Quick previews only |
+| 20 | Medium | Medium (~18s) | Good for testing |
+| 30 | Good | Medium (~21s) | **Recommended balance** ⭐ |
+| 40 | Excellent | Slow (~28s) | **Best quality** ⭐ |
+| 50 | Max | Very slow | Final output, high detail |
+
+### 4. Guidance Scale
+| Value | Effect |
+|-------|--------|
+| 1.0 | Disables CFG (follows prompt loosely) |
+| 2.0 | Low guidance |
+| **3.0** | **Recommended sweet spot** |
+| 4.0+ | High guidance (can look over-processed) |
+
+### 5. Prompt Engineering
+**Be descriptive about BOTH visuals AND audio:**
+```
+Good: "A cat sitting calmly on a cushion, soft lighting, gentle purring sounds"
+Bad: "A cat"
+```
+
+**Mention camera movement:**
+```
+"camera pans slowly across the scene"
+"static shot, focused on the subject"
+"handheld camera, slight movement"
+```
+
+**Include lighting details:**
+```
+"soft natural lighting from window"
+"dramatic shadows, cinematic lighting"
+"golden hour sunset lighting"
+```
+
+**For speech generation:**
+```
+"A person speaking: [dialogue text], [scene description]"
+```
+
+**For ambient audio:**
+```
+"A waterfall in a forest with rushing water sounds and birds chirping"
+```
+
+### 6. Image Conditioning (Character Consistency)
+Use `image_start` for consistent character appearance:
+
+```json
+{
+  "image_start": "base64_reference_image",
+  "image_strength": 1.0,  // 0.0-1.0, higher = more consistency
+  "prompt": "The scene comes alive with gentle movement"
+}
+```
+
+**Tips:**
+- Use high-quality reference images
+- Set `image_strength: 1.0` for maximum consistency
+- Keep seed consistent for similar expressions
+- Use 40+ inference steps for best quality
+
+### 7. Seed Control
+Use seeds for reproducibility:
+```json
+{
+  "seed": 1234567890
+}
+```
+
+**Strategy:**
+1. Test with random seeds until you find a good one
+2. Save that seed for consistent results
+3. Vary seeds to explore different interpretations
+
+### 8. Workflow Recommendations
+
+**For Character Videos (e.g., Aiko):**
+1. Generate high-quality base image
+2. Use as `image_start` with `image_strength: 1.0`
+3. Keep seed consistent
+4. Use 40+ inference steps
+
+**For Product Demos:**
+1. Start with product image as `image_start`
+2. Describe motion in prompt
+3. Use 30-40 inference steps
+4. Test with 9 frames first, then scale up
+
+**For Backgrounds/Scenery:**
+1. Be very descriptive
+2. Mention camera movement
+3. Use 49-121 frames for smooth motion
+4. Try multiple seeds for different compositions
+
+---
 
 ## API Reference
 
@@ -125,18 +260,18 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | required | Video description. Include "A person speaking: [dialogue]" for speech |
+| `prompt` | string | required | Video description. Include "A person speaking: [dialogue]" for speech. **Be descriptive about visuals AND audio.** |
 | `negative_prompt` | string | "blurry..." | What to avoid |
-| `width` | int | 768 | Must be divisible by 32 (recommend 288 for 9:16) |
-| `height` | int | 512 | Must be divisible by 32 |
-| `num_frames` | int | 121 | Number of frames (~5 sec at 25fps) |
+| `width` | int | 288 | Must be divisible by 32. **288 recommended for 9:16 mobile/TikTok** |
+| `height` | int | 512 | Must be divisible by 32. **512 recommended for 9:16 mobile/TikTok** |
+| `num_frames` | int | 49 | Number of frames (49=~2s, 121=~5s at 24fps). Use 9 for quick previews. |
 | `fps` | int | 25 | Frame rate |
-| `guidance_scale` | float | 3.0 | CFG scale (1.0 disables CFG, 3.0 recommended) |
-| `num_inference_steps` | int | 40 | Quality steps (20-50, higher = better quality) |
-| `seed` | int | random | For reproducibility |
-| `image_start` | string | null | Base64 image for first frame conditioning |
+| `guidance_scale` | float | 3.0 | CFG scale (1.0 disables CFG, **3.0 recommended** as sweet spot) |
+| `num_inference_steps` | int | 40 | Quality steps (**5=preview**, **30=good**, **40=excellent**, 50=max). |
+| `seed` | int | random | For reproducibility. Save good seeds! |
+| `image_start` | string | null | Base64 image for first frame conditioning (use for character consistency) |
 | `image_end` | string | null | Base64 image for last frame conditioning |
-| `image_strength` | float | 1.0 | Image conditioning strength (0.0-1.0, higher = stronger adherence) |
+| `image_strength` | float | 1.0 | Image conditioning strength (0.0-1.0, **1.0=max adherence** to start image) |
 | `include_audio` | bool | true | Include generated audio in output |
 | `audio` | string | null | Base64 WAV audio for audio-to-video conditioning |
 | `audio_strength` | float | 1.0 | Audio conditioning strength (0.0-1.0) |
