@@ -376,16 +376,17 @@ def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | No
     return audio
 
 
-def decode_video_from_file(path: str, frame_cap: int, device: DeviceLikeType) -> Generator[torch.Tensor]:
+def decode_video_from_file(path: str, frame_cap: int | None, device: DeviceLikeType) -> Generator[torch.Tensor]:
     container = av.open(path)
     try:
         video_stream = next(s for s in container.streams if s.type == "video")
         for frame in container.decode(video_stream):
             tensor = torch.tensor(frame.to_rgb().to_ndarray(), dtype=torch.uint8, device=device).unsqueeze(0)
             yield tensor
-            frame_cap = frame_cap - 1
-            if frame_cap == 0:
-                break
+            if frame_cap is not None:
+                frame_cap = frame_cap - 1
+                if frame_cap == 0:
+                    break
     finally:
         container.close()
 
