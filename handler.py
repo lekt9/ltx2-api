@@ -62,11 +62,7 @@ from ltx_core.text_encoders.gemma import (
 )
 from ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
 from ltx_core.types import AudioLatentShape, VideoPixelShape
-from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
 from ltx_pipelines.distilled import DistilledPipeline
-from ltx_pipelines.ic_lora import ICLoraPipeline
-from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE, DEFAULT_NEGATIVE_PROMPT
 
@@ -98,27 +94,12 @@ EMBEDDINGS_CONNECTORS = {
     "two_stage": "ltx-2-19b-dev_embeddings_connector.safetensors",
 }
 
-# IC-LoRA control model files (downloaded lazily on first use)
-IC_LORA_FILES = {
-    "depth": "ltx-2-19b-ic-lora-depth-control.safetensors",
-    "canny": "ltx-2-19b-ic-lora-canny-control.safetensors",
-    "pose": "ltx-2-19b-ic-lora-pose-control.safetensors",
-}
-
-# Distilled LoRA for keyframe interpolation stage 2
-DISTILLED_LORA_FILE = "ltx-2-19b-distilled-lora-384.safetensors"
-
 # Updated constants (from Wan2GP)
 DEFAULT_FPS = 24.0
 DEFAULT_GUIDANCE_SCALE = 4.0
 DEFAULT_NUM_INFERENCE_STEPS = 40
 
-# FP8 quantization mode
-FP8_MODE = os.environ.get("FP8_MODE", "false").lower() in ("true", "1", "yes")
-
-# Global pipeline manager
-pipeline_manager = None
-# Keep backward-compat globals (used by encode_audio_to_latent)
+# Global pipeline instance
 pipeline = None
 models = None
 
@@ -248,13 +229,9 @@ def _load_component(model, path: str, sd_ops=None, dtype=torch.bfloat16, preproc
     return model
 
 
-# Global model paths dict (populated during init_models)
-_model_paths: dict[str, str] = {}
-
-
 def init_models(variant: str = "distilled"):
     """Initialize all model components."""
-    global models, _model_paths
+    global models
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -391,18 +368,6 @@ def init_models(variant: str = "distilled"):
 
     print("All models loaded successfully")
 
-    # Store model file paths for lazy pipeline construction
-    _model_paths.update({
-        "transformer": transformer_path,
-        "spatial_upsampler": spatial_upsampler_path,
-        "gemma_root": gemma_safetensors,
-        "video_vae": video_vae_path,
-        "audio_vae": audio_vae_path,
-        "vocoder": vocoder_path,
-        "text_projection": text_projection_path,
-        "embeddings_connector": embeddings_connector_path,
-    })
-
     # Create models namespace
     models = types.SimpleNamespace(
         text_encoder=text_encoder,
@@ -421,8 +386,8 @@ def init_models(variant: str = "distilled"):
 
 
 def init_pipeline(variant: str = "distilled"):
-    """Initialize the pipeline manager with all models."""
-    global pipeline, models, pipeline_manager
+    """Initialize the pipeline with all models."""
+    global pipeline, models
 
     if models is None:
         models = init_models(variant)
@@ -442,158 +407,7 @@ def init_pipeline(variant: str = "distilled"):
         )
 
     print(f"Pipeline initialized: {type(pipeline).__name__}")
-
-    # Create pipeline manager wrapping the default pipeline
-    pipeline_manager = PipelineManager(
-        variant=variant,
-        default_pipeline=pipeline,
-        models=models,
-        model_paths=_model_paths,
-    )
-
     return pipeline
-
-
-class PipelineManager:
-    """Manages pipeline lifecycle and lazy switching between pipeline types."""
-
-    def __init__(self, variant: str, default_pipeline, models, model_paths: dict):
-        self.variant = variant
-        self.default_pipeline = default_pipeline
-        self.models = models
-        self.model_paths = model_paths
-        self.current_pipeline = default_pipeline
-        self.current_type = "default"
-        self._ic_lora_paths: dict[str, str] = {}
-        self._distilled_lora_path: str | None = None
-        self._dev_transformer_path: str | None = None
-
-    def _ensure_dev_transformer(self) -> str:
-        """Download the dev transformer if not already available."""
-        if self._dev_transformer_path is not None:
-            return self._dev_transformer_path
-        # If current variant is two_stage, the transformer IS the dev model
-        if self.variant == "two_stage":
-            self._dev_transformer_path = self.model_paths["transformer"]
-            return self._dev_transformer_path
-        # Otherwise download the dev model
-        print("Downloading dev transformer for IC-LoRA/keyframe pipeline...")
-        self._dev_transformer_path = download_model_file(TRANSFORMER_FILES["two_stage"])
-        print(f"  Dev transformer: {self._dev_transformer_path}")
-        return self._dev_transformer_path
-
-    def _ensure_ic_lora(self, control_type: str) -> str:
-        """Download IC-LoRA file for the given control type."""
-        if control_type in self._ic_lora_paths:
-            return self._ic_lora_paths[control_type]
-        filename = IC_LORA_FILES.get(control_type)
-        if filename is None:
-            raise ValueError(f"Unknown control type: {control_type}. Must be one of: {list(IC_LORA_FILES.keys())}")
-        print(f"Downloading IC-LoRA model for {control_type}...")
-        path = download_model_file(filename)
-        self._ic_lora_paths[control_type] = path
-        print(f"  IC-LoRA {control_type}: {path}")
-        return path
-
-    def _ensure_distilled_lora(self) -> str:
-        """Download the distilled LoRA for keyframe interpolation."""
-        if self._distilled_lora_path is not None:
-            return self._distilled_lora_path
-        print("Downloading distilled LoRA for keyframe pipeline...")
-        self._distilled_lora_path = download_model_file(DISTILLED_LORA_FILE)
-        print(f"  Distilled LoRA: {self._distilled_lora_path}")
-        return self._distilled_lora_path
-
-    def get_pipeline(self, mode: str, fp8: bool = False, control_type: str | None = None,
-                     lora_entries: list | None = None):
-        """Get the appropriate pipeline for the given mode.
-
-        Returns the pipeline instance. Switches pipelines lazily as needed.
-        """
-        device = torch.device("cuda")
-        use_fp8 = fp8 or FP8_MODE
-
-        if mode == "controlnet":
-            if not control_type:
-                raise ValueError("control_type is required for controlnet mode")
-            ic_lora_path = self._ensure_ic_lora(control_type)
-            dev_path = self._ensure_dev_transformer()
-            loras = [LoraPathStrengthAndSDOps(ic_lora_path, 1.0, LTXV_LORA_COMFY_RENAMING_MAP)]
-            if lora_entries:
-                loras.extend(lora_entries)
-            pipe_key = f"controlnet_{control_type}"
-            if self.current_type != pipe_key:
-                print(f"Switching to ICLoraPipeline ({control_type})...")
-                self._release_current()
-                self.current_pipeline = ICLoraPipeline(
-                    checkpoint_path=dev_path,
-                    spatial_upsampler_path=self.model_paths["spatial_upsampler"],
-                    gemma_root=self.model_paths["gemma_root"],
-                    loras=loras,
-                    device=device,
-                    fp8transformer=use_fp8,
-                )
-                self.current_type = pipe_key
-            return self.current_pipeline
-
-        if mode == "keyframe_interpolation":
-            dev_path = self._ensure_dev_transformer()
-            distilled_lora_path = self._ensure_distilled_lora()
-            distilled_lora = [LoraPathStrengthAndSDOps(distilled_lora_path, 1.0, LTXV_LORA_COMFY_RENAMING_MAP)]
-            user_loras = list(lora_entries) if lora_entries else []
-            pipe_key = "keyframe_interpolation"
-            if self.current_type != pipe_key:
-                print("Switching to KeyframeInterpolationPipeline...")
-                self._release_current()
-                self.current_pipeline = KeyframeInterpolationPipeline(
-                    checkpoint_path=dev_path,
-                    distilled_lora=distilled_lora,
-                    spatial_upsampler_path=self.model_paths["spatial_upsampler"],
-                    gemma_root=self.model_paths["gemma_root"],
-                    loras=user_loras,
-                    device=device,
-                    fp8transformer=use_fp8,
-                )
-                self.current_type = pipe_key
-            return self.current_pipeline
-
-        # Default modes: text_to_video, image_to_video, inpainting, video_extension, video_to_audio
-        if lora_entries:
-            # LoRA requires ModelLedger path — create a temporary pipeline
-            print("Creating temporary pipeline with LoRA support...")
-            if self.variant == "distilled":
-                return DistilledPipeline(
-                    checkpoint_path=self.model_paths["transformer"],
-                    spatial_upsampler_path=self.model_paths["spatial_upsampler"],
-                    gemma_root=self.model_paths["gemma_root"],
-                    loras=list(lora_entries),
-                    device=device,
-                    fp8transformer=use_fp8,
-                )
-            else:
-                return TI2VidTwoStagesPipeline(
-                    checkpoint_path=self.model_paths["transformer"],
-                    spatial_upsampler_path=self.model_paths["spatial_upsampler"],
-                    gemma_root=self.model_paths["gemma_root"],
-                    loras=list(lora_entries),
-                    device=device,
-                    fp8transformer=use_fp8,
-                )
-
-        # Return the default (pre-loaded) pipeline
-        if self.current_type != "default":
-            print("Switching back to default pipeline...")
-            self._release_current()
-            self.current_pipeline = self.default_pipeline
-            self.current_type = "default"
-        return self.default_pipeline
-
-    def _release_current(self):
-        """Release the current pipeline to free GPU memory."""
-        if self.current_pipeline is not None and self.current_pipeline is not self.default_pipeline:
-            del self.current_pipeline
-            self.current_pipeline = None
-            cleanup_gpu_memory()
 
 
 def _normalize_tiling_size(tile_size: int) -> int:
@@ -673,161 +487,6 @@ def _decode_base64_image(image_data: str) -> Image.Image | None:
     except Exception as e:
         print(f"Warning: Failed to decode image: {e}")
         return None
-
-
-def _decode_base64_video(data: str) -> str | None:
-    """Decode a base64 encoded video to a temp file path.
-
-    Pipelines expect file paths for video inputs. Returns the path to a
-    temporary MP4 file. Caller is responsible for cleanup.
-    """
-    if not data:
-        return None
-    try:
-        if data.startswith("data:"):
-            data = data.split(",", 1)[1]
-        video_bytes = base64.b64decode(data)
-        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        tmp.write(video_bytes)
-        tmp.close()
-        return tmp.name
-    except Exception as e:
-        print(f"Warning: Failed to decode video: {e}")
-        return None
-
-
-def _decode_base64_mask(data: str, num_frames: int | None = None) -> torch.Tensor | None:
-    """Decode a base64 mask image to a tensor.
-
-    The mask image is interpreted as a single-frame spatial mask:
-    white (255) = generate, black (0) = preserve. Returns a float tensor
-    in [0, 1] range.
-    """
-    if not data:
-        return None
-    try:
-        if data.startswith("data:"):
-            data = data.split(",", 1)[1]
-        mask_bytes = base64.b64decode(data)
-        mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
-        mask_np = np.array(mask_img, dtype=np.float32) / 255.0
-        mask_tensor = torch.from_numpy(mask_np)
-        if num_frames is not None and num_frames > 1:
-            # Expand to temporal dimension: (T, H, W)
-            mask_tensor = mask_tensor.unsqueeze(0).expand(num_frames, -1, -1)
-        return mask_tensor
-    except Exception as e:
-        print(f"Warning: Failed to decode mask: {e}")
-        return None
-
-
-def _decode_keyframes(keyframes_list: list[dict]) -> list[tuple]:
-    """Decode a list of keyframe dicts with base64 images.
-
-    Each keyframe dict should have: {image: base64, frame_index: int, strength: float}
-    Returns list of (PIL.Image, latent_frame_index, strength) tuples.
-    """
-    latent_stride = 8
-    result = []
-    for kf in keyframes_list:
-        img = _decode_base64_image(kf.get("image", ""))
-        if img is None:
-            print(f"Warning: Skipping keyframe with invalid image")
-            continue
-        frame_index = int(kf.get("frame_index", 0))
-        strength = float(kf.get("strength", 1.0))
-        latent_idx = _to_latent_index(frame_index, latent_stride)
-        result.append((img, latent_idx, strength))
-    return result
-
-
-def _resolve_lora_entries(loras_list: list[dict] | None) -> list[LoraPathStrengthAndSDOps] | None:
-    """Resolve a list of LoRA dicts to LoraPathStrengthAndSDOps entries.
-
-    Each dict should have: {path: str, strength: float}
-    The path can be a local file path or a HuggingFace repo_id/filename.
-    """
-    if not loras_list:
-        return None
-    entries = []
-    for lora in loras_list:
-        path = lora.get("path", "")
-        strength = float(lora.get("strength", 1.0))
-        if not path:
-            continue
-        # If path contains '/' and doesn't exist locally, try HuggingFace download
-        if "/" in path and not os.path.isfile(path):
-            try:
-                parts = path.split("/", 1)
-                if len(parts) == 2:
-                    path = hf_hub_download(repo_id=parts[0] + "/" + parts[1].split("/")[0],
-                                           filename="/".join(parts[1].split("/")[1:]),
-                                           cache_dir=CACHE_DIR)
-                else:
-                    path = download_model_file(path)
-            except Exception:
-                # Try as a direct model repo file
-                try:
-                    path = download_model_file(path)
-                except Exception as e:
-                    print(f"Warning: Could not resolve LoRA path '{path}': {e}")
-                    continue
-        entries.append(LoraPathStrengthAndSDOps(path, strength, LTXV_LORA_COMFY_RENAMING_MAP))
-    return entries if entries else None
-
-
-def _align_frames(num_frames: int) -> int:
-    """Align frame count to 8k+1 format expected by the video VAE.
-
-    The video VAE temporal compression uses a stride of 8, so the total
-    frame count should be 8k+1 for proper encoding.
-    """
-    if num_frames <= 1:
-        return 1
-    # Round up to nearest 8k+1
-    k = math.ceil((num_frames - 1) / 8)
-    return k * 8 + 1
-
-
-def _extract_frames_from_video(video_path: str, max_frames: int | None = None) -> list[Image.Image]:
-    """Extract frames from a video file as PIL Images."""
-    frames = []
-    try:
-        # Use ffmpeg to extract frames
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pattern = os.path.join(tmpdir, "frame_%06d.png")
-            cmd = ["ffmpeg", "-i", video_path, "-vsync", "0"]
-            if max_frames is not None:
-                cmd.extend(["-vframes", str(max_frames)])
-            cmd.extend([pattern])
-            subprocess.run(cmd, check=True, capture_output=True)
-
-            # Read extracted frames
-            idx = 1
-            while True:
-                frame_path = pattern % idx
-                if not os.path.exists(frame_path):
-                    break
-                frames.append(Image.open(frame_path).convert("RGB"))
-                idx += 1
-    except Exception as e:
-        print(f"Warning: Failed to extract frames from video: {e}")
-    return frames
-
-
-def _get_video_frame_count(video_path: str) -> int:
-    """Get the number of frames in a video file."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", video_path],
-            capture_output=True, text=True, check=True
-        )
-        return int(result.stdout.strip())
-    except Exception:
-        # Fallback: extract all frames and count
-        frames = _extract_frames_from_video(video_path)
-        return len(frames)
 
 
 def _collect_video_chunks(video: Iterator[torch.Tensor] | torch.Tensor) -> torch.Tensor | None:
@@ -942,9 +601,123 @@ def encode_audio_to_latent(audio_data: bytes, target_frames: int, fps: float) ->
         return None
 
 
-def _process_pipeline_output(output, num_frames: int, height: int, width: int,
-                             fps: float, seed: int, generation_time: float) -> dict[str, Any]:
-    """Common output processing for all generation functions."""
+def generate_video(
+    prompt: str,
+    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
+    num_frames: int = 121,
+    height: int = 512,
+    width: int = 768,
+    fps: float = DEFAULT_FPS,
+    num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
+    guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
+    seed: int = 0,
+    audio_data: bytes | None = None,
+    audio_strength: float = 1.0,
+    tile_size: int | None = None,
+    image_start: Image.Image | None = None,
+    image_end: Image.Image | None = None,
+    image_strength: float = 1.0,
+) -> dict[str, Any]:
+    """Generate video from text prompt."""
+    global pipeline, models
+
+    if pipeline is None:
+        init_pipeline(MODEL_VARIANT)
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    # Align dimensions to 64
+    target_height = int(height)
+    target_width = int(width)
+    if target_height % 64 != 0:
+        target_height = int(math.ceil(target_height / 64) * 64)
+    if target_width % 64 != 0:
+        target_width = int(math.ceil(target_width / 64) * 64)
+
+    # Build tiling config
+    tiling_config = _build_tiling_config(tile_size, fps)
+
+    # Process audio conditioning if provided
+    audio_conditionings = None
+    if audio_data is not None and audio_strength > 0.0:
+        audio_latent = encode_audio_to_latent(audio_data, num_frames, fps)
+        if audio_latent is not None:
+            audio_conditionings = [AudioConditionByLatent(audio_latent, audio_strength)]
+
+    # Build image conditioning list (following Wan2GP pattern)
+    # Latent stride is typically 8 for the video VAE temporal compression
+    latent_stride = 8
+    images = []
+    images_stage2 = []
+
+    # Clamp image_strength to valid range
+    image_strength = max(0.0, min(1.0, float(image_strength)))
+
+    if isinstance(pipeline, TI2VidTwoStagesPipeline):
+        # For two-stage pipeline, we need both images and images_stage2
+        if image_start is not None:
+            entry = (image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos")
+            images.append(entry)
+            images_stage2.append(entry)
+            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
+
+        if image_end is not None:
+            entry = (image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0)
+            images.append(entry)
+            images_stage2.append(entry)
+            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
+    else:
+        # For distilled pipeline, single images list
+        if image_start is not None:
+            images.append((image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos"))
+            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
+
+        if image_end is not None:
+            images.append((image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0))
+            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
+
+    # Generate video
+    print(f"Generating video: {prompt[:60]}...")
+    print(f"  Resolution: {target_width}x{target_height}, Frames: {num_frames}, Seed: {seed}")
+    start_time = time.time()
+
+    if isinstance(pipeline, TI2VidTwoStagesPipeline):
+        neg_prompt = negative_prompt if negative_prompt else DEFAULT_NEGATIVE_PROMPT
+        output = pipeline(
+            prompt=prompt,
+            negative_prompt=neg_prompt,
+            seed=int(seed),
+            height=target_height,
+            width=target_width,
+            num_frames=int(num_frames),
+            frame_rate=float(fps),
+            num_inference_steps=int(num_inference_steps),
+            cfg_guidance_scale=float(guidance_scale),
+            images=images,
+            images_stage2=images_stage2 if images_stage2 else None,
+            tiling_config=tiling_config,
+            enhance_prompt=False,
+            audio_conditionings=audio_conditionings,
+        )
+    else:
+        output = pipeline(
+            prompt=prompt,
+            seed=int(seed),
+            height=target_height,
+            width=target_width,
+            num_frames=int(num_frames),
+            frame_rate=float(fps),
+            images=images,
+            tiling_config=tiling_config,
+            enhance_prompt=False,
+            audio_conditionings=audio_conditionings,
+        )
+
+    generation_time = time.time() - start_time
+    print(f"Generation completed in {generation_time:.1f}s")
+
+    # Process output
     if isinstance(output, tuple) and len(output) >= 2:
         video, audio = output[0], output[1]
     else:
@@ -982,480 +755,6 @@ def _process_pipeline_output(output, num_frames: int, height: int, width: int,
         "generation_time": generation_time,
         "seed": seed,
     }
-
-
-def generate_video(
-    prompt: str,
-    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    num_frames: int = 121,
-    height: int = 512,
-    width: int = 768,
-    fps: float = DEFAULT_FPS,
-    num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
-    guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
-    seed: int = 0,
-    audio_data: bytes | None = None,
-    audio_strength: float = 1.0,
-    tile_size: int | None = None,
-    image_start: Image.Image | None = None,
-    image_end: Image.Image | None = None,
-    image_strength: float = 1.0,
-    source_video_path: str | None = None,
-    mask_tensor: torch.Tensor | None = None,
-    mask_strength: float = 1.0,
-    mask_start_frame: int = 0,
-    lora_entries: list | None = None,
-    fp8: bool = False,
-) -> dict[str, Any]:
-    """Generate video from text prompt. Supports masking/inpainting and LoRA."""
-    global pipeline, models, pipeline_manager
-
-    if pipeline_manager is None:
-        init_pipeline(MODEL_VARIANT)
-
-    # Get pipeline (handles LoRA switching)
-    active_pipeline = pipeline_manager.get_pipeline(
-        mode="text_to_video", fp8=fp8, lora_entries=lora_entries
-    )
-
-    device = torch.device("cuda")
-
-    # Align dimensions to 64
-    target_height = int(height)
-    target_width = int(width)
-    if target_height % 64 != 0:
-        target_height = int(math.ceil(target_height / 64) * 64)
-    if target_width % 64 != 0:
-        target_width = int(math.ceil(target_width / 64) * 64)
-
-    # Build tiling config
-    tiling_config = _build_tiling_config(tile_size, fps)
-
-    # Process audio conditioning if provided
-    audio_conditionings = None
-    if audio_data is not None and audio_strength > 0.0:
-        audio_latent = encode_audio_to_latent(audio_data, num_frames, fps)
-        if audio_latent is not None:
-            audio_conditionings = [AudioConditionByLatent(audio_latent, audio_strength)]
-
-    # Build image conditioning list (following Wan2GP pattern)
-    # Latent stride is typically 8 for the video VAE temporal compression
-    latent_stride = 8
-    images = []
-    images_stage2 = []
-
-    # Clamp image_strength to valid range
-    image_strength = max(0.0, min(1.0, float(image_strength)))
-
-    if isinstance(active_pipeline, TI2VidTwoStagesPipeline):
-        # For two-stage pipeline, we need both images and images_stage2
-        if image_start is not None:
-            entry = (image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos")
-            images.append(entry)
-            images_stage2.append(entry)
-            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
-
-        if image_end is not None:
-            entry = (image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0)
-            images.append(entry)
-            images_stage2.append(entry)
-            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
-    else:
-        # For distilled pipeline, single images list
-        if image_start is not None:
-            images.append((image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos"))
-            print(f"  Start frame conditioning: latent_idx=0, strength={image_strength}")
-
-        if image_end is not None:
-            images.append((image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0))
-            print(f"  End frame conditioning: latent_idx={_to_latent_index(num_frames - 1, latent_stride)}, strength=1.0")
-
-    # Build masking source for inpainting
-    masking_source = None
-    masking_strength_val = None
-    if source_video_path and mask_tensor is not None:
-        masking_source = {
-            "video": source_video_path,
-            "mask": mask_tensor,
-            "start_frame": mask_start_frame,
-        }
-        masking_strength_val = float(mask_strength)
-        print(f"  Masking: strength={mask_strength}, start_frame={mask_start_frame}")
-
-    # Generate video
-    print(f"Generating video: {prompt[:60]}...")
-    print(f"  Resolution: {target_width}x{target_height}, Frames: {num_frames}, Seed: {seed}")
-    start_time = time.time()
-
-    if isinstance(active_pipeline, TI2VidTwoStagesPipeline):
-        neg_prompt = negative_prompt if negative_prompt else DEFAULT_NEGATIVE_PROMPT
-        output = active_pipeline(
-            prompt=prompt,
-            negative_prompt=neg_prompt,
-            seed=int(seed),
-            height=target_height,
-            width=target_width,
-            num_frames=int(num_frames),
-            frame_rate=float(fps),
-            num_inference_steps=int(num_inference_steps),
-            cfg_guidance_scale=float(guidance_scale),
-            images=images,
-            images_stage2=images_stage2 if images_stage2 else None,
-            tiling_config=tiling_config,
-            enhance_prompt=False,
-            audio_conditionings=audio_conditionings,
-            masking_source=masking_source,
-            masking_strength=masking_strength_val,
-        )
-    else:
-        output = active_pipeline(
-            prompt=prompt,
-            seed=int(seed),
-            height=target_height,
-            width=target_width,
-            num_frames=int(num_frames),
-            frame_rate=float(fps),
-            images=images,
-            tiling_config=tiling_config,
-            enhance_prompt=False,
-            audio_conditionings=audio_conditionings,
-            masking_source=masking_source,
-            masking_strength=masking_strength_val,
-        )
-
-    generation_time = time.time() - start_time
-    print(f"Generation completed in {generation_time:.1f}s")
-
-    return _process_pipeline_output(output, num_frames, height, width, fps, seed, generation_time)
-
-
-def generate_controlnet_video(
-    prompt: str,
-    control_type: str,
-    control_video_path: str,
-    control_strength: float = 1.0,
-    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    num_frames: int = 121,
-    height: int = 512,
-    width: int = 768,
-    fps: float = DEFAULT_FPS,
-    seed: int = 0,
-    tile_size: int | None = None,
-    image_start: Image.Image | None = None,
-    image_end: Image.Image | None = None,
-    image_strength: float = 1.0,
-    audio_data: bytes | None = None,
-    audio_strength: float = 1.0,
-    lora_entries: list | None = None,
-    fp8: bool = False,
-) -> dict[str, Any]:
-    """Generate video with IC-LoRA controlnet conditioning."""
-    global pipeline_manager
-
-    if pipeline_manager is None:
-        init_pipeline(MODEL_VARIANT)
-
-    active_pipeline = pipeline_manager.get_pipeline(
-        mode="controlnet", fp8=fp8, control_type=control_type, lora_entries=lora_entries
-    )
-
-    # Align dimensions
-    target_height = int(height)
-    target_width = int(width)
-    if target_height % 64 != 0:
-        target_height = int(math.ceil(target_height / 64) * 64)
-    if target_width % 64 != 0:
-        target_width = int(math.ceil(target_width / 64) * 64)
-
-    tiling_config = _build_tiling_config(tile_size, fps)
-
-    # Audio conditioning
-    audio_conditionings = None
-    if audio_data is not None and audio_strength > 0.0:
-        audio_latent = encode_audio_to_latent(audio_data, num_frames, fps)
-        if audio_latent is not None:
-            audio_conditionings = [AudioConditionByLatent(audio_latent, audio_strength)]
-
-    # Build image conditionings
-    latent_stride = 8
-    images = []
-    image_strength = max(0.0, min(1.0, float(image_strength)))
-    if image_start is not None:
-        images.append((image_start, _to_latent_index(0, latent_stride), image_strength, "lanczos"))
-    if image_end is not None:
-        images.append((image_end, _to_latent_index(num_frames - 1, latent_stride), 1.0))
-
-    # Build video conditioning for IC-LoRA
-    video_conditioning = [(control_video_path, float(control_strength))]
-
-    print(f"Generating controlnet video ({control_type}): {prompt[:60]}...")
-    print(f"  Resolution: {target_width}x{target_height}, Frames: {num_frames}, Seed: {seed}")
-    start_time = time.time()
-
-    output = active_pipeline(
-        prompt=prompt,
-        seed=int(seed),
-        height=target_height,
-        width=target_width,
-        num_frames=int(num_frames),
-        frame_rate=float(fps),
-        images=images,
-        video_conditioning=video_conditioning,
-        tiling_config=tiling_config,
-        enhance_prompt=False,
-        audio_conditionings=audio_conditionings,
-    )
-
-    generation_time = time.time() - start_time
-    print(f"ControlNet generation completed in {generation_time:.1f}s")
-
-    return _process_pipeline_output(output, num_frames, height, width, fps, seed, generation_time)
-
-
-def generate_keyframe_video(
-    prompt: str,
-    keyframes: list[tuple],
-    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    num_frames: int = 121,
-    height: int = 512,
-    width: int = 768,
-    fps: float = DEFAULT_FPS,
-    num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
-    guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
-    seed: int = 0,
-    tile_size: int | None = None,
-    audio_data: bytes | None = None,
-    audio_strength: float = 1.0,
-    lora_entries: list | None = None,
-    fp8: bool = False,
-) -> dict[str, Any]:
-    """Generate video by interpolating between keyframes."""
-    global pipeline_manager
-
-    if pipeline_manager is None:
-        init_pipeline(MODEL_VARIANT)
-
-    active_pipeline = pipeline_manager.get_pipeline(
-        mode="keyframe_interpolation", fp8=fp8, lora_entries=lora_entries
-    )
-
-    # Align dimensions
-    target_height = int(height)
-    target_width = int(width)
-    if target_height % 64 != 0:
-        target_height = int(math.ceil(target_height / 64) * 64)
-    if target_width % 64 != 0:
-        target_width = int(math.ceil(target_width / 64) * 64)
-
-    tiling_config = _build_tiling_config(tile_size, fps)
-
-    # Audio conditioning
-    audio_conditionings = None
-    if audio_data is not None and audio_strength > 0.0:
-        audio_latent = encode_audio_to_latent(audio_data, num_frames, fps)
-        if audio_latent is not None:
-            audio_conditionings = [AudioConditionByLatent(audio_latent, audio_strength)]
-
-    neg_prompt = negative_prompt if negative_prompt else DEFAULT_NEGATIVE_PROMPT
-
-    print(f"Generating keyframe interpolation video: {prompt[:60]}...")
-    print(f"  Resolution: {target_width}x{target_height}, Frames: {num_frames}, Seed: {seed}")
-    print(f"  Keyframes: {len(keyframes)} frames")
-    start_time = time.time()
-
-    output = active_pipeline(
-        prompt=prompt,
-        negative_prompt=neg_prompt,
-        seed=int(seed),
-        height=target_height,
-        width=target_width,
-        num_frames=int(num_frames),
-        frame_rate=float(fps),
-        num_inference_steps=int(num_inference_steps),
-        cfg_guidance_scale=float(guidance_scale),
-        images=keyframes,
-        tiling_config=tiling_config,
-        enhance_prompt=False,
-        audio_conditionings=audio_conditionings,
-    )
-
-    generation_time = time.time() - start_time
-    print(f"Keyframe interpolation completed in {generation_time:.1f}s")
-
-    return _process_pipeline_output(output, num_frames, height, width, fps, seed, generation_time)
-
-
-def generate_video_extension(
-    prompt: str,
-    source_video_path: str,
-    num_continuation_frames: int = 61,
-    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    height: int = 512,
-    width: int = 768,
-    fps: float = DEFAULT_FPS,
-    num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
-    guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
-    seed: int = 0,
-    tile_size: int | None = None,
-    audio_data: bytes | None = None,
-    audio_strength: float = 1.0,
-    lora_entries: list | None = None,
-    fp8: bool = False,
-) -> dict[str, Any]:
-    """Extend a video by generating continuation frames.
-
-    Uses masking: source frames are preserved (mask=0), continuation frames
-    are generated (mask=1). The last source frame is used as an image
-    conditioning at the boundary for visual continuity.
-    """
-    global pipeline_manager
-
-    if pipeline_manager is None:
-        init_pipeline(MODEL_VARIANT)
-
-    # Count source video frames
-    source_frame_count = _get_video_frame_count(source_video_path)
-    if source_frame_count <= 0:
-        return {"error": "Could not read source video frames"}
-
-    # Compute total frames aligned to 8k+1
-    total_frames = _align_frames(source_frame_count + num_continuation_frames)
-    actual_continuation = total_frames - source_frame_count
-
-    # Build temporal mask: 0 for source frames (preserve), 1 for continuation (generate)
-    # Shape (1, T, 1, 1) so _coerce_mask_tensor maps it to (1, 1, T, 1, 1) which
-    # broadcasts spatially across all pixels per frame.
-    mask = torch.zeros(1, total_frames, 1, 1, dtype=torch.float32)
-    mask[0, source_frame_count:, 0, 0] = 1.0
-
-    # Extract last source frame for boundary conditioning
-    source_frames = _extract_frames_from_video(source_video_path)
-    boundary_image = source_frames[-1] if source_frames else None
-
-    print(f"Video extension: {source_frame_count} source + {actual_continuation} new = {total_frames} total frames")
-
-    # Use generate_video with masking
-    return generate_video(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        num_frames=total_frames,
-        height=height,
-        width=width,
-        fps=fps,
-        num_inference_steps=num_inference_steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        audio_data=audio_data,
-        audio_strength=audio_strength,
-        tile_size=tile_size,
-        image_start=boundary_image,
-        image_strength=1.0,
-        source_video_path=source_video_path,
-        mask_tensor=mask,
-        mask_strength=1.0,
-        mask_start_frame=0,
-        lora_entries=lora_entries,
-        fp8=fp8,
-    )
-
-
-def generate_audio_for_video(
-    prompt: str,
-    source_video_path: str,
-    negative_prompt: str = "blurry, low quality, distorted, glitchy, watermark",
-    fps: float = DEFAULT_FPS,
-    num_inference_steps: int = DEFAULT_NUM_INFERENCE_STEPS,
-    guidance_scale: float = DEFAULT_GUIDANCE_SCALE,
-    seed: int = 0,
-    tile_size: int | None = None,
-    lora_entries: list | None = None,
-    fp8: bool = False,
-) -> dict[str, Any]:
-    """Generate audio for an existing video (foley/V2A).
-
-    Conditions all video frames as image conditionings with strength=1.0
-    so the video stays fixed while audio is generated by the joint model.
-    """
-    global pipeline_manager
-
-    if pipeline_manager is None:
-        init_pipeline(MODEL_VARIANT)
-
-    # Extract frames from source video
-    source_frames = _extract_frames_from_video(source_video_path)
-    if not source_frames:
-        return {"error": "Could not extract frames from source video"}
-
-    num_frames = len(source_frames)
-    # Get dimensions from first frame
-    width, height = source_frames[0].size
-
-    active_pipeline = pipeline_manager.get_pipeline(
-        mode="video_to_audio", fp8=fp8, lora_entries=lora_entries
-    )
-
-    # Align dimensions
-    target_height = int(height)
-    target_width = int(width)
-    if target_height % 64 != 0:
-        target_height = int(math.ceil(target_height / 64) * 64)
-    if target_width % 64 != 0:
-        target_width = int(math.ceil(target_width / 64) * 64)
-
-    tiling_config = _build_tiling_config(tile_size, fps)
-
-    # Build image conditionings from all source frames at their respective positions
-    latent_stride = 8
-    images = []
-    for frame_idx in range(0, num_frames, latent_stride):
-        if frame_idx < len(source_frames):
-            latent_idx = _to_latent_index(frame_idx, latent_stride)
-            images.append((source_frames[frame_idx], latent_idx, 1.0))
-
-    # Also add first and last frames to ensure coverage
-    if source_frames:
-        images.insert(0, (source_frames[0], 0, 1.0, "lanczos"))
-        last_latent_idx = _to_latent_index(num_frames - 1, latent_stride)
-        images.append((source_frames[-1], last_latent_idx, 1.0))
-
-    print(f"Generating audio for video: {prompt[:60]}...")
-    print(f"  Source: {num_frames} frames, {len(images)} conditionings")
-    start_time = time.time()
-
-    if isinstance(active_pipeline, TI2VidTwoStagesPipeline):
-        neg_prompt = negative_prompt if negative_prompt else DEFAULT_NEGATIVE_PROMPT
-        output = active_pipeline(
-            prompt=prompt,
-            negative_prompt=neg_prompt,
-            seed=int(seed),
-            height=target_height,
-            width=target_width,
-            num_frames=int(num_frames),
-            frame_rate=float(fps),
-            num_inference_steps=int(num_inference_steps),
-            cfg_guidance_scale=float(guidance_scale),
-            images=images,
-            images_stage2=images,
-            tiling_config=tiling_config,
-            enhance_prompt=False,
-        )
-    else:
-        output = active_pipeline(
-            prompt=prompt,
-            seed=int(seed),
-            height=target_height,
-            width=target_width,
-            num_frames=int(num_frames),
-            frame_rate=float(fps),
-            images=images,
-            tiling_config=tiling_config,
-            enhance_prompt=False,
-        )
-
-    generation_time = time.time() - start_time
-    print(f"Audio generation completed in {generation_time:.1f}s")
-
-    return _process_pipeline_output(output, num_frames, height, width, fps, seed, generation_time)
 
 
 def video_to_base64(video_np: np.ndarray, fps: float = 24.0, audio_np: np.ndarray | None = None, audio_sr: int = 24000) -> str:

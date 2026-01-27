@@ -19,10 +19,6 @@ from typing import Optional
 # Import the handler functions
 from handler import (
     generate_video,
-    generate_controlnet_video,
-    generate_keyframe_video,
-    generate_video_extension,
-    generate_audio_for_video,
     video_to_base64,
     init_pipeline,
     MODEL_VARIANT,
@@ -31,10 +27,6 @@ from handler import (
     DEFAULT_GUIDANCE_SCALE,
     DEFAULT_NUM_INFERENCE_STEPS,
     _decode_base64_image,
-    _decode_base64_video,
-    _decode_base64_mask,
-    _decode_keyframes,
-    _resolve_lora_entries,
 )
 
 # Lock to ensure only one generation at a time per worker
@@ -77,35 +69,6 @@ class VideoRequest(BaseModel):
     image_end: Optional[str] = Field(default=None, description="Base64-encoded image for last frame conditioning")
     image_strength: float = Field(default=1.0, description="Image conditioning strength (0.0-1.0)")
 
-    # Generation mode selector
-    mode: str = Field(
-        default="text_to_video",
-        description="Generation mode: text_to_video, image_to_video, controlnet, keyframe_interpolation, video_extension, video_to_audio, inpainting"
-    )
-
-    # ControlNet (IC-LoRA)
-    control_type: Optional[str] = Field(default=None, description="Control type: depth, pose, canny")
-    control_video: Optional[str] = Field(default=None, description="Base64-encoded control signal video (MP4)")
-    control_strength: float = Field(default=1.0, description="Control signal strength (0.0-1.0)")
-
-    # Keyframe Interpolation
-    keyframes: Optional[list] = Field(default=None, description="List of keyframe dicts: [{image: base64, frame_index: int, strength: float}]")
-
-    # Video Extension / Video-to-Audio / Inpainting (shared input)
-    source_video: Optional[str] = Field(default=None, description="Base64-encoded source video (MP4)")
-    num_continuation_frames: Optional[int] = Field(default=None, description="Number of frames to generate for video extension")
-
-    # Masking/Inpainting
-    mask: Optional[str] = Field(default=None, description="Base64-encoded mask image (white=generate, black=preserve)")
-    mask_strength: float = Field(default=1.0, description="Mask strength (0.0-1.0)")
-    mask_start_frame: int = Field(default=0, description="Frame index where mask starts")
-
-    # LoRA
-    loras: Optional[list] = Field(default=None, description="List of LoRA dicts: [{path: str, strength: float}]")
-
-    # FP8 quantization mode
-    fp8: bool = Field(default=False, description="Use FP8 quantization for lower VRAM usage")
-
 
 class VideoResponse(BaseModel):
     video: str
@@ -116,7 +79,6 @@ class VideoResponse(BaseModel):
     seed: int
     generation_time_seconds: float
     has_audio: bool
-    mode: str = "text_to_video"
     has_image_start: bool = False
     has_image_end: bool = False
 
@@ -147,29 +109,17 @@ async def root():
         "model": f"{MODEL_REPO} ({MODEL_VARIANT} variant)",
         "features": {
             "audio_output": "Generates synchronized audio with video",
-            "audio_input": "Condition video generation on audio input",
+            "audio_input": "SUPPORTED - condition video generation on audio input",
             "two_stage": "Two-stage generation with spatial upsampling (2x)",
-            "controlnet": "IC-LoRA control via depth, pose, or canny signals",
-            "keyframe_interpolation": "Interpolate between keyframe images",
-            "video_extension": "Extend existing videos with continuation frames",
-            "video_to_audio": "Generate audio for existing video (foley)",
-            "inpainting": "Mask-based video inpainting",
-            "lora": "Custom LoRA weight loading",
-            "fp8": "FP8 quantization for lower VRAM usage",
         },
         "endpoints": {
-            "POST /generate": "Generate video (mode-based routing)",
+            "POST /generate": "Generate video with audio from text",
             "GET /health": "Health check",
             "GET /docs": "Interactive API documentation",
         },
         "modes": {
-            "text_to_video": "Text prompt only",
-            "image_to_video": "Text prompt + image_start/image_end",
-            "controlnet": "Text + control_type + control_video",
-            "keyframe_interpolation": "Text + keyframes list",
-            "video_extension": "Text + source_video + num_continuation_frames",
-            "video_to_audio": "Text + source_video (generates audio track)",
-            "inpainting": "Text + source_video + mask",
+            "text-to-video": "Provide only 'prompt' parameter",
+            "audio-to-video": "Provide 'prompt' and 'audio' (base64 WAV) parameters",
         },
         "defaults": {
             "resolution": "768x512",
@@ -193,224 +143,71 @@ async def busy():
 @app.post("/generate", response_model=VideoResponse)
 async def generate(request: VideoRequest):
     """
-    Generate a video with synchronized audio.
+    Generate a video with synchronized audio from text prompt.
 
-    Use the `mode` field to select the generation type:
-    - **text_to_video** (default): Generate from text prompt
-    - **image_to_video**: Generate from text + start/end images
-    - **controlnet**: Generate with IC-LoRA control signals (depth/pose/canny)
-    - **keyframe_interpolation**: Interpolate between keyframe images
-    - **video_extension**: Extend an existing video with new frames
-    - **video_to_audio**: Generate audio for an existing video
-    - **inpainting**: Mask-based video inpainting
+    Dimensions should be divisible by 64 for optimal results.
 
-    All modes support optional LoRA weights and FP8 quantization.
+    For audio-to-video, provide a base64-encoded WAV audio in the 'audio' field.
+
+    Audio is generated automatically and included in the output MP4.
+    Set include_audio=false to get video-only output.
     """
     def run_generation():
         with generation_lock:
-            mode = request.mode
-            temp_files = []
+            # Decode audio if provided
+            audio_data = None
+            if request.audio:
+                audio_base64 = request.audio
+                if audio_base64.startswith("data:"):
+                    audio_base64 = audio_base64.split(",", 1)[1]
+                audio_data = base64.b64decode(audio_base64)
 
-            try:
-                # Decode audio if provided
-                audio_data = None
-                if request.audio:
-                    audio_base64 = request.audio
-                    if audio_base64.startswith("data:"):
-                        audio_base64 = audio_base64.split(",", 1)[1]
-                    audio_data = base64.b64decode(audio_base64)
+            # Decode images if provided
+            image_start = _decode_base64_image(request.image_start)
+            image_end = _decode_base64_image(request.image_end)
 
-                # Decode images if provided
-                image_start = _decode_base64_image(request.image_start)
-                image_end = _decode_base64_image(request.image_end)
+            # Generate video
+            result = generate_video(
+                prompt=request.prompt,
+                negative_prompt=request.negative_prompt,
+                num_frames=request.num_frames,
+                height=request.height,
+                width=request.width,
+                fps=request.fps,
+                num_inference_steps=request.num_inference_steps,
+                guidance_scale=request.guidance_scale,
+                seed=request.seed or 0,
+                audio_data=audio_data,
+                audio_strength=request.audio_strength,
+                tile_size=request.tile_size,
+                image_start=image_start,
+                image_end=image_end,
+                image_strength=request.image_strength,
+            )
 
-                # Resolve LoRA entries
-                lora_entries = _resolve_lora_entries(request.loras)
+            if "error" in result:
+                raise Exception(result["error"])
 
-                # Decode source video if provided (used by multiple modes)
-                source_video_path = None
-                if request.source_video:
-                    source_video_path = _decode_base64_video(request.source_video)
-                    if source_video_path:
-                        temp_files.append(source_video_path)
+            # Encode video to base64
+            video_base64 = video_to_base64(
+                result["video"],
+                fps=result["fps"],
+                audio_np=result.get("audio") if request.include_audio else None,
+                audio_sr=result.get("audio_sample_rate", 24000),
+            )
 
-                # Decode control video if provided
-                control_video_path = None
-                if request.control_video:
-                    control_video_path = _decode_base64_video(request.control_video)
-                    if control_video_path:
-                        temp_files.append(control_video_path)
-
-                # Route based on mode
-                if mode == "controlnet":
-                    if not control_video_path:
-                        raise ValueError("control_video is required for controlnet mode")
-                    if not request.control_type:
-                        raise ValueError("control_type is required for controlnet mode")
-                    result = generate_controlnet_video(
-                        prompt=request.prompt,
-                        control_type=request.control_type,
-                        control_video_path=control_video_path,
-                        control_strength=request.control_strength,
-                        negative_prompt=request.negative_prompt,
-                        num_frames=request.num_frames,
-                        height=request.height,
-                        width=request.width,
-                        fps=request.fps,
-                        seed=request.seed or 0,
-                        tile_size=request.tile_size,
-                        image_start=image_start,
-                        image_end=image_end,
-                        image_strength=request.image_strength,
-                        audio_data=audio_data,
-                        audio_strength=request.audio_strength,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                elif mode == "keyframe_interpolation":
-                    if not request.keyframes:
-                        raise ValueError("keyframes list is required for keyframe_interpolation mode")
-                    keyframes = _decode_keyframes(request.keyframes)
-                    if not keyframes:
-                        raise ValueError("No valid keyframes provided")
-                    result = generate_keyframe_video(
-                        prompt=request.prompt,
-                        keyframes=keyframes,
-                        negative_prompt=request.negative_prompt,
-                        num_frames=request.num_frames,
-                        height=request.height,
-                        width=request.width,
-                        fps=request.fps,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
-                        seed=request.seed or 0,
-                        tile_size=request.tile_size,
-                        audio_data=audio_data,
-                        audio_strength=request.audio_strength,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                elif mode == "video_extension":
-                    if not source_video_path:
-                        raise ValueError("source_video is required for video_extension mode")
-                    result = generate_video_extension(
-                        prompt=request.prompt,
-                        source_video_path=source_video_path,
-                        num_continuation_frames=request.num_continuation_frames or 61,
-                        negative_prompt=request.negative_prompt,
-                        height=request.height,
-                        width=request.width,
-                        fps=request.fps,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
-                        seed=request.seed or 0,
-                        tile_size=request.tile_size,
-                        audio_data=audio_data,
-                        audio_strength=request.audio_strength,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                elif mode == "video_to_audio":
-                    if not source_video_path:
-                        raise ValueError("source_video is required for video_to_audio mode")
-                    result = generate_audio_for_video(
-                        prompt=request.prompt,
-                        source_video_path=source_video_path,
-                        negative_prompt=request.negative_prompt,
-                        fps=request.fps,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
-                        seed=request.seed or 0,
-                        tile_size=request.tile_size,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                elif mode == "inpainting":
-                    if not source_video_path:
-                        raise ValueError("source_video is required for inpainting mode")
-                    mask_tensor = _decode_base64_mask(request.mask, request.num_frames)
-                    result = generate_video(
-                        prompt=request.prompt,
-                        negative_prompt=request.negative_prompt,
-                        num_frames=request.num_frames,
-                        height=request.height,
-                        width=request.width,
-                        fps=request.fps,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
-                        seed=request.seed or 0,
-                        audio_data=audio_data,
-                        audio_strength=request.audio_strength,
-                        tile_size=request.tile_size,
-                        image_start=image_start,
-                        image_end=image_end,
-                        image_strength=request.image_strength,
-                        source_video_path=source_video_path,
-                        mask_tensor=mask_tensor,
-                        mask_strength=request.mask_strength,
-                        mask_start_frame=request.mask_start_frame,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                else:
-                    # text_to_video / image_to_video (default)
-                    result = generate_video(
-                        prompt=request.prompt,
-                        negative_prompt=request.negative_prompt,
-                        num_frames=request.num_frames,
-                        height=request.height,
-                        width=request.width,
-                        fps=request.fps,
-                        num_inference_steps=request.num_inference_steps,
-                        guidance_scale=request.guidance_scale,
-                        seed=request.seed or 0,
-                        audio_data=audio_data,
-                        audio_strength=request.audio_strength,
-                        tile_size=request.tile_size,
-                        image_start=image_start,
-                        image_end=image_end,
-                        image_strength=request.image_strength,
-                        lora_entries=lora_entries,
-                        fp8=request.fp8,
-                    )
-
-                if "error" in result:
-                    raise Exception(result["error"])
-
-                # Encode video to base64
-                video_base64 = video_to_base64(
-                    result["video"],
-                    fps=result["fps"],
-                    audio_np=result.get("audio") if request.include_audio else None,
-                    audio_sr=result.get("audio_sample_rate", 24000),
-                )
-
-                return {
-                    "video": f"data:video/mp4;base64,{video_base64}",
-                    "fps": result["fps"],
-                    "height": result["height"],
-                    "width": result["width"],
-                    "num_frames": result["num_frames"],
-                    "seed": result["seed"],
-                    "generation_time_seconds": round(result["generation_time"], 2),
-                    "has_audio": request.include_audio and result.get("audio") is not None,
-                    "mode": mode,
-                    "has_image_start": image_start is not None,
-                    "has_image_end": image_end is not None,
-                }
-
-            finally:
-                # Clean up temp files
-                for tmp_path in temp_files:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+            return {
+                "video": f"data:video/mp4;base64,{video_base64}",
+                "fps": result["fps"],
+                "height": result["height"],
+                "width": result["width"],
+                "num_frames": result["num_frames"],
+                "seed": result["seed"],
+                "generation_time_seconds": round(result["generation_time"], 2),
+                "has_audio": request.include_audio and result.get("audio") is not None,
+                "has_image_start": image_start is not None,
+                "has_image_end": image_end is not None,
+            }
 
     try:
         # Run in thread pool to not block the event loop
